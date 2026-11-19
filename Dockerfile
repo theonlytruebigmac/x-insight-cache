@@ -1,17 +1,15 @@
-FROM node:20-alpine AS build
+FROM node:20-bookworm-slim AS build
 WORKDIR /app
-# better-sqlite3 needs a native build toolchain at install time only.
-RUN apk add --no-cache python3 make g++
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
-RUN mkdir -p /app/data && addgroup -S app && adduser -S app -G app && chown -R app:app /app
-USER app
+RUN mkdir -p /app/data && chown -R node:node /app
+USER node
 ENV DB_PATH=/app/data/cache.db
 VOLUME ["/app/data"]
 EXPOSE 8787
