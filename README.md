@@ -27,19 +27,38 @@ of this and flip `host_permissions` back on in the extension's manifest.
 
 | Endpoint | Request | Response |
 |---|---|---|
-| `GET /lookup?users=a,b,c` | comma-separated lowercase handles | `{"results": {"handle": {t,l,d,a,af,id,c,uc}}, "misses": ["handle", ...]}` |
-| `POST /contribute` | `{"entries": {"handle": {l,d,a,af,c,id,uc}}}` | `{"accepted": N}` |
-| `GET /stats` | — | `{"totalEntries", "totalContributions", "lastUpdated"}` |
+| `GET /lookup?users=a,b,c` | comma-separated lowercase handles | `{"results": {"handle": {t,l,d,a,af,id,c,uc}}, "notFound": {"handle": {"t": 123}}, "misses": ["handle", ...]}` |
+| `POST /contribute` | `{"entries": {"handle": {l,d,a,af,c,id,uc,t}}}`; confirmed X 404: `{"handle": {"nf": true, "t": 123}}` | `{"accepted": N}` |
+| `GET /stats` | — | `{"totalEntries", "totalNotFoundEntries", "totalContributions", "lastUpdated"}` |
 
 Field shorthand: `t`=last-updated (unix seconds), `l`=location, `d`=device,
 `a`=location-accurate (bool), `af`=affiliation badge, `id`=numeric account
 ID, `c`=account creation (unix seconds), `uc`=handle-change count.
+An explicit `af: ""` means affiliation was checked and none was present; an
+omitted `af` means unknown. A contribution with `nf: true` is a confirmed
+not-found result and is shared for 24 hours by default
+(`NOT_FOUND_TTL_SECONDS`).
+
+On `/contribute`, `t` is optional and means *when the client observed* the
+data (unix seconds; defaults to now, future values clamp to now, values past
+`RETENTION_DAYS` are dropped). Merging is newer-observation-wins: an older
+upload can't overwrite newer location/device data but still fills fields the
+row lacks, and when two observations name different account `id`s (a
+recycled handle) the newer one replaces the row outright. `accepted` counts
+entries that passed validation, so it can be lower than the number sent.
+An active negative result is returned separately from `misses`; it is counted
+as a cache hit, but never as a profile entry. A newer profile observation
+clears an older negative result, while a newer negative result temporarily
+hides an older profile observation.
 
 All three endpoints require `Authorization: Bearer <API_KEY>`. Upstream's
 own changelog documents a cache-poisoning bug from an unauthenticated
 `/contribute` — this server requires a key for both reads and writes from
 the start, and independently re-validates every field server-side rather
-than trusting the client (see `src/validate.js`).
+than trusting the client (see `src/validate.js`). Anyone holding a community
+key can submit profile or not-found observations, so only distribute it to
+trusted members; the 24-hour default bounds the effect of an incorrect
+not-found contribution.
 
 ## Deploy
 
@@ -78,7 +97,9 @@ device, affiliation or account ID. Cache data is read-only; the dashboard
 does not record who looked up whom.
 
 The dashboard also includes filters, sort, CSV/JSON export, API-key management,
-freshness counts, device/location breakdowns, and aggregate usage charts.
+freshness counts, device/location breakdowns, aggregate lookup hit/miss and
+not-found trends, and HTTP 429 counts for lookup and contribution requests.
+Activity is hourly and aggregate-only; it does not retain handles or client IPs.
 Activity history begins when this server version is deployed; older lookup and
 contribution events cannot be reconstructed from the cache database.
 Managed extension keys have the same read/write permissions as `API_KEY`.
@@ -91,8 +112,9 @@ Dashboard credentials are separate from the shared extension API key.
 Login creates an HttpOnly, SameSite=Strict cookie valid for eight hours.
 Sessions are held in memory: logout invalidates that session, and restarting
 the server invalidates all sessions (including when rotating credentials).
-Login attempts are limited to 10 per IP per 15 minutes. Behind a proxy,
-clients may share this limit because forwarded IP headers are not trusted.
+Login attempts are limited to 10 per client IP per 15 minutes. Behind the
+documented single Traefik hop, `trust proxy` uses the forwarded client IP for
+rate limiting; requests directly to the loopback port cannot spoof it.
 
 **Use HTTPS in production.** Session cookies have `Secure` enabled by default,
 including behind Traefik. For local HTTP testing only, set

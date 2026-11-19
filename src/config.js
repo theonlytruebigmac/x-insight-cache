@@ -24,6 +24,7 @@ export const config = {
 
   retentionDays: int('RETENTION_DAYS', 60),
   cleanupIntervalMs: int('CLEANUP_INTERVAL_MS', 60 * 60 * 1000), // hourly
+  notFoundTtlSeconds: int('NOT_FOUND_TTL_SECONDS', 24 * 60 * 60),
 
   maxLookupUsers: int('MAX_LOOKUP_USERS', 100),
   maxContributeEntries: int('MAX_CONTRIBUTE_ENTRIES', 200),

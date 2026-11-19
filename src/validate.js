@@ -37,6 +37,13 @@ function clampString(value) {
   return trimmed.slice(0, config.maxFieldLength);
 }
 
+function observationTime(raw) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (raw.t === undefined) return nowSeconds;
+  if (!Number.isInteger(raw.t) || raw.t < nowSeconds - config.retentionDays * 86400) return null;
+  return Math.min(raw.t, nowSeconds);
+}
+
 /**
  * Validate and normalize one contribute() entry. Returns null to drop a
  * malformed entry rather than failing the whole batch — one bad client
@@ -45,11 +52,21 @@ function clampString(value) {
 function sanitizeEntry(username, raw) {
   if (!isValidUsername(username) || !raw || typeof raw !== 'object') return null;
 
+  const observedAt = observationTime(raw);
+  if (observedAt === null) return null;
+
+  if (raw.nf === true) {
+    if (observedAt < Math.floor(Date.now() / 1000) - config.notFoundTtlSeconds) return null;
+    return { username: username.toLowerCase(), notFound: true, observedAt };
+  }
+
   const location = clampString(raw.l);
   const device = clampString(raw.d);
   if (!location && !device) return null; // nothing worth storing
 
-  const affiliation = clampString(raw.af);
+  // An explicit empty string means the client checked affiliation and found none.
+  // Missing/null remains unknown and must not overwrite a known affiliation.
+  const affiliation = raw.af === '' ? '' : clampString(raw.af);
 
   const accountId = typeof raw.id === 'string' && ACCOUNT_ID_RE.test(raw.id) ? raw.id : null;
 
@@ -70,7 +87,8 @@ function sanitizeEntry(username, raw) {
     affiliation,
     accountId,
     createdAt,
-    usernameChanges
+    usernameChanges,
+    observedAt
   };
 }
 
@@ -85,9 +103,11 @@ export function parseContributeBody(body) {
   }
 
   const entries = [];
+  const notFound = [];
   for (const key of keys) {
     const sanitized = sanitizeEntry(key, body.entries[key]);
-    if (sanitized) entries.push(sanitized);
+    if (sanitized?.notFound) notFound.push(sanitized);
+    else if (sanitized) entries.push(sanitized);
   }
-  return { ok: true, entries };
+  return { ok: true, entries, notFound };
 }

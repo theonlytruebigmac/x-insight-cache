@@ -274,10 +274,12 @@ async function load() {
     const minutes = Math.floor(stats.uptimeSeconds / 60);
     $('uptime').textContent = `${Math.floor(minutes / 1440)}d ${Math.floor(minutes / 60) % 24}h ${minutes % 60}m`;
     const hits = history.buckets.reduce((sum, bucket) => sum + bucket.hits, 0);
+    const notFoundHits = history.buckets.reduce((sum, bucket) => sum + (bucket.notFoundHits || 0), 0);
     const misses = history.buckets.reduce((sum, bucket) => sum + bucket.misses, 0);
-    $('hit-rate').textContent = hits + misses ? `${Math.round(hits * 100 / (hits + misses))}%` : '—';
-    $('hit-rate-caption').textContent = hits + misses
-      ? `Across ${number.format(hits + misses)} account lookups in this period`
+    $('hit-rate').textContent = hits + notFoundHits + misses
+      ? `${Math.round((hits + notFoundHits) * 100 / (hits + notFoundHits + misses))}%` : '—';
+    $('hit-rate-caption').textContent = hits + notFoundHits + misses
+      ? `Across ${number.format(hits + notFoundHits + misses)} account lookups in this period`
       : 'No lookups in this period yet';
     $('expiring-count').textContent = number.format(breakdowns.expiringEntries);
     $('expired-count').textContent = number.format(breakdowns.expiredEntries);
@@ -299,9 +301,14 @@ async function load() {
     renderChart($('lookup-chart'), history, [
       { field: 'requests', name: 'requests' },
       { field: 'hits', name: 'hits' },
-      { field: 'misses', name: 'misses' }
+      { field: 'notFoundHits', name: 'not-found' },
+      { field: 'misses', name: 'misses' },
+      { field: 'lookupRateLimited', name: 'rate-limited' }
     ]);
-    renderChart($('contribution-chart'), history, [{ field: 'contributions', name: 'contributions' }]);
+    renderChart($('contribution-chart'), history, [
+      { field: 'contributions', name: 'contributions' },
+      { field: 'contributeRateLimited', name: 'rate-limited' }
+    ]);
     renderEntries(data.entries, stats.retentionDays);
     $('empty').hidden = data.entries.length > 0;
     $('empty').textContent = search

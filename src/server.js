@@ -16,7 +16,7 @@ import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
 import { requireApiKey } from './auth.js';
 import { parseUsersParam, parseContributeBody } from './validate.js';
-import { getMany, upsertMany, getStats, cleanup, recordActivity } from './db.js';
+import { getMany, getNotFoundMany, upsertMany, upsertNotFoundMany, getStats, cleanup, recordActivity } from './db.js';
 import admin from './admin.js';
 
 if (!config.apiKey) {
@@ -34,17 +34,45 @@ if (!!config.adminUsername !== !!config.adminPassword) {
   process.exit(1);
 }
 app.disable('x-powered-by');
+// Trust exactly one hop of X-Forwarded-For. The only paths to this process
+// are Traefik (one real proxy hop, on the t3_proxy network) or 127.0.0.1 on
+// the Docker host itself -- there's no untrusted multi-hop chain in front of
+// it. Without this, express-rate-limit refuses to use X-Forwarded-For at all
+// (see ERR_ERL_UNEXPECTED_X_FORWARDED_FOR) and every client behind Traefik
+// collapses into one shared rate-limit bucket, same bug for admin.js's login
+// limiter. `1` -- not `true` -- deliberately: trusting only one hop means a
+// request straight to the loopback port can't spoof X-Forwarded-For to fake
+// a different rate-limit identity, since no real proxy added one there.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '256kb' }));
 app.get('/', (req, res) => res.redirect('/admin/'));
 app.use('/admin', admin);
 
 app.use(
   '/lookup',
-  rateLimit({ windowMs: config.rateLimitWindowMs, limit: config.lookupRateLimit, standardHeaders: true, legacyHeaders: false })
+  rateLimit({
+    windowMs: config.rateLimitWindowMs,
+    limit: config.lookupRateLimit,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req, res) => {
+      recordActivity({ lookupRateLimited: 1 });
+      res.status(429).json({ error: 'Too many requests, please try again later.' });
+    }
+  })
 );
 app.use(
   '/contribute',
-  rateLimit({ windowMs: config.rateLimitWindowMs, limit: config.contributeRateLimit, standardHeaders: true, legacyHeaders: false })
+  rateLimit({
+    windowMs: config.rateLimitWindowMs,
+    limit: config.contributeRateLimit,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req, res) => {
+      recordActivity({ contributeRateLimited: 1 });
+      res.status(429).json({ error: 'Too many requests, please try again later.' });
+    }
+  })
 );
 
 app.get('/lookup', requireApiKey, (req, res) => {
@@ -55,33 +83,42 @@ app.get('/lookup', requireApiKey, (req, res) => {
   }
 
   const rows = getMany(parsed.usernames);
-  recordActivity({
-    lookupRequests: 1,
-    lookupHits: parsed.usernames.filter((username) => rows.has(username)).length,
-    lookupMisses: parsed.usernames.filter((username) => !rows.has(username)).length
-  });
-  const results = {};
+  const notFoundRows = getNotFoundMany(parsed.usernames);
+  const notFound = {};
   const misses = [];
-
+  const results = {};
+  let hits = 0;
+  let notFoundHits = 0;
   for (const username of parsed.usernames) {
     const row = rows.get(username);
-    if (!row) {
+    const negative = notFoundRows.get(username);
+    if (negative && (!row || negative.observed_at > row.updated_at)) {
+      notFound[username] = { t: negative.observed_at };
+      notFoundHits++;
+    } else if (row) {
+      results[username] = {
+        t: row.updated_at,
+        l: row.location,
+        d: row.device,
+        a: !!row.location_accurate,
+        ...(row.affiliation !== null ? { af: row.affiliation } : {}),
+        ...(row.account_id ? { id: row.account_id } : {}),
+        ...(row.created_at ? { c: row.created_at } : {}),
+        ...(row.username_changes !== null ? { uc: row.username_changes } : {})
+      };
+      hits++;
+    } else {
       misses.push(username);
-      continue;
     }
-    results[username] = {
-      t: row.updated_at,
-      l: row.location,
-      d: row.device,
-      a: !!row.location_accurate,
-      ...(row.affiliation ? { af: row.affiliation } : {}),
-      ...(row.account_id ? { id: row.account_id } : {}),
-      ...(row.created_at ? { c: row.created_at } : {}),
-      ...(row.username_changes !== null ? { uc: row.username_changes } : {})
-    };
   }
+  recordActivity({
+    lookupRequests: 1,
+    lookupHits: hits,
+    lookupMisses: misses.length,
+    lookupNotFoundHits: notFoundHits
+  });
 
-  res.json({ results, misses });
+  res.json({ results, notFound, misses });
 });
 
 app.post('/contribute', requireApiKey, (req, res) => {
@@ -91,7 +128,7 @@ app.post('/contribute', requireApiKey, (req, res) => {
     return;
   }
 
-  const accepted = upsertMany(parsed.entries);
+  const accepted = upsertMany(parsed.entries) + upsertNotFoundMany(parsed.notFound);
   res.json({ accepted });
 });
 

@@ -29,6 +29,13 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_entries_updated_at ON entries(updated_at);
 
+  CREATE TABLE IF NOT EXISTS not_found_entries (
+    username TEXT PRIMARY KEY,
+    observed_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_not_found_expires_at ON not_found_entries(expires_at);
+
   CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -39,6 +46,9 @@ db.exec(`
     lookup_requests INTEGER NOT NULL DEFAULT 0,
     lookup_hits INTEGER NOT NULL DEFAULT 0,
     lookup_misses INTEGER NOT NULL DEFAULT 0,
+    lookup_not_found_hits INTEGER NOT NULL DEFAULT 0,
+    lookup_rate_limited INTEGER NOT NULL DEFAULT 0,
+    contribute_rate_limited INTEGER NOT NULL DEFAULT 0,
     contribution_entries INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_activity_bucket ON activity(bucket);
@@ -53,6 +63,15 @@ db.exec(`
   );
 `);
 
+const activityColumns = new Set(db.prepare('PRAGMA table_info(activity)').all().map((column) => column.name));
+for (const [name, definition] of [
+  ['lookup_not_found_hits', 'INTEGER NOT NULL DEFAULT 0'],
+  ['lookup_rate_limited', 'INTEGER NOT NULL DEFAULT 0'],
+  ['contribute_rate_limited', 'INTEGER NOT NULL DEFAULT 0']
+]) {
+  if (!activityColumns.has(name)) db.exec(`ALTER TABLE activity ADD COLUMN ${name} ${definition}`);
+}
+
 function getMeta(key, fallback) {
   const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
   return row ? row.value : fallback;
@@ -66,33 +85,79 @@ function incrMeta(key, by) {
   return next;
 }
 
+// Merge rules for a contribution against an existing row. Contributions carry their
+// observation time, so arrival order no longer decides which data wins:
+//  - the newer observation wins each field it actually has; the other fills gaps
+//  - if both rows name different account ids, the handle was recycled: the newer
+//    observation replaces the row wholesale (never mix two accounts' fields)
+// SQLite evaluates every SET expression against the pre-update row.
+const NEWER = 'excluded.updated_at >= entries.updated_at';
+const SAME_ACCOUNT = '(excluded.account_id IS NULL OR entries.account_id IS NULL OR excluded.account_id = entries.account_id)';
+const pickNewer = (column) => `CASE
+        WHEN NOT ${SAME_ACCOUNT} THEN CASE WHEN ${NEWER} THEN excluded.${column} ELSE entries.${column} END
+        WHEN ${NEWER} THEN COALESCE(excluded.${column}, entries.${column})
+        ELSE COALESCE(entries.${column}, excluded.${column}) END`;
+
 const stmts = {
   getMany: db.prepare(`
     SELECT username, location, device, location_accurate, affiliation, account_id, created_at, username_changes, updated_at
     FROM entries WHERE username IN (SELECT value FROM json_each(?))
   `),
+  getNotFoundMany: db.prepare(`
+    SELECT n.username, n.observed_at
+    FROM not_found_entries n
+    LEFT JOIN entries e ON e.username = n.username
+    WHERE n.username IN (SELECT value FROM json_each(?))
+      AND n.expires_at > ?
+      AND (e.username IS NULL OR n.observed_at > e.updated_at)
+  `),
+  upsertNotFound: db.prepare(`
+    INSERT INTO not_found_entries (username, observed_at, expires_at)
+    VALUES (@username, @observedAt, @expiresAt)
+    ON CONFLICT(username) DO UPDATE SET
+      observed_at = excluded.observed_at,
+      expires_at = excluded.expires_at
+    WHERE excluded.observed_at >= not_found_entries.observed_at
+  `),
+  entryUpdatedAt: db.prepare('SELECT updated_at FROM entries WHERE username = ?'),
+  clearOlderNotFound: db.prepare(`
+    DELETE FROM not_found_entries WHERE username = ? AND observed_at <= ?
+  `),
   upsert: db.prepare(`
     INSERT INTO entries (username, location, device, location_accurate, affiliation, account_id, created_at, username_changes, updated_at)
     VALUES (@username, @location, @device, @locationAccurate, @affiliation, @accountId, @createdAt, @usernameChanges, @updatedAt)
     ON CONFLICT(username) DO UPDATE SET
-      location = excluded.location,
-      device = excluded.device,
-      location_accurate = excluded.location_accurate,
-      affiliation = COALESCE(excluded.affiliation, entries.affiliation),
-      account_id = COALESCE(excluded.account_id, entries.account_id),
-      created_at = COALESCE(excluded.created_at, entries.created_at),
-      username_changes = COALESCE(excluded.username_changes, entries.username_changes),
-      updated_at = excluded.updated_at
+      location = ${pickNewer('location')},
+      device = ${pickNewer('device')},
+      location_accurate = CASE
+        WHEN NOT ${SAME_ACCOUNT} THEN CASE WHEN ${NEWER} THEN excluded.location_accurate ELSE entries.location_accurate END
+        WHEN ${NEWER} AND excluded.location IS NOT NULL THEN excluded.location_accurate
+        WHEN entries.location IS NULL AND excluded.location IS NOT NULL THEN excluded.location_accurate
+        ELSE entries.location_accurate END,
+      affiliation = ${pickNewer('affiliation')},
+      account_id = ${pickNewer('account_id')},
+      created_at = ${pickNewer('created_at')},
+      username_changes = ${pickNewer('username_changes')},
+      updated_at = MAX(excluded.updated_at, entries.updated_at)
   `),
   count: db.prepare('SELECT COUNT(*) AS n FROM entries'),
   deleteOlderThan: db.prepare('DELETE FROM entries WHERE updated_at < ?'),
   activityUpsert: db.prepare(`
-    INSERT INTO activity (bucket, lookup_requests, lookup_hits, lookup_misses, contribution_entries)
-    VALUES (@bucket, @lookupRequests, @lookupHits, @lookupMisses, @contributionEntries)
+    INSERT INTO activity (
+      bucket, lookup_requests, lookup_hits, lookup_misses, lookup_not_found_hits,
+      lookup_rate_limited, contribute_rate_limited, contribution_entries
+    )
+    VALUES (
+      @bucket, @lookupRequests, @lookupHits, @lookupMisses, @lookupNotFoundHits,
+      @lookupRateLimited, @contributeRateLimited, @contributionEntries
+    )
     ON CONFLICT(bucket) DO UPDATE SET
       lookup_requests = lookup_requests + excluded.lookup_requests,
       lookup_hits = lookup_hits + excluded.lookup_hits,
       lookup_misses = lookup_misses + excluded.lookup_misses,
+      lookup_not_found_hits = lookup_not_found_hits + excluded.lookup_not_found_hits,
+      lookup_rate_limited = lookup_rate_limited + excluded.lookup_rate_limited,
+      contribute_rate_limited = contribute_rate_limited + excluded.contribute_rate_limited,
       contribution_entries = contribution_entries + excluded.contribution_entries
   `)
 };
@@ -102,9 +167,13 @@ function currentHour() {
 }
 
 /** Store only hourly aggregate counts; no usernames or IP addresses. */
-export function recordActivity({ lookupRequests = 0, lookupHits = 0, lookupMisses = 0, contributionEntries = 0 }) {
+export function recordActivity({
+  lookupRequests = 0, lookupHits = 0, lookupMisses = 0, lookupNotFoundHits = 0,
+  lookupRateLimited = 0, contributeRateLimited = 0, contributionEntries = 0
+}) {
   stmts.activityUpsert.run({
-    bucket: currentHour(), lookupRequests, lookupHits, lookupMisses, contributionEntries
+    bucket: currentHour(), lookupRequests, lookupHits, lookupMisses, lookupNotFoundHits,
+    lookupRateLimited, contributeRateLimited, contributionEntries
   });
 }
 
@@ -151,7 +220,15 @@ export function getMany(usernames) {
   return new Map(rows.map((r) => [r.username, r]));
 }
 
-/** @param {Array<{username:string, location?, device?, locationAccurate?, affiliation?, accountId?, createdAt?, usernameChanges?}>} entries */
+/** @param {string[]} usernames already-lowercased */
+export function getNotFoundMany(usernames) {
+  if (!usernames.length) return new Map();
+  const now = Math.floor(Date.now() / 1000);
+  const rows = stmts.getNotFoundMany.all(JSON.stringify(usernames), now);
+  return new Map(rows.map((row) => [row.username, row]));
+}
+
+/** @param {Array<{username:string, location?, device?, locationAccurate?, affiliation?, accountId?, createdAt?, usernameChanges?, observedAt?}>} entries */
 export function upsertMany(entries) {
   const now = Math.floor(Date.now() / 1000);
   const tx = db.transaction((rows) => {
@@ -165,8 +242,9 @@ export function upsertMany(entries) {
         accountId: e.accountId ?? null,
         createdAt: e.createdAt ?? null,
         usernameChanges: e.usernameChanges ?? null,
-        updatedAt: now
+        updatedAt: Number.isInteger(e.observedAt) ? Math.min(e.observedAt, now) : now
       });
+      stmts.clearOlderNotFound.run(e.username, Number.isInteger(e.observedAt) ? Math.min(e.observedAt, now) : now);
     }
   });
   tx(entries);
@@ -178,9 +256,34 @@ export function upsertMany(entries) {
   return entries.length;
 }
 
+/** @param {Array<{username:string, observedAt:number}>} entries */
+export function upsertNotFoundMany(entries) {
+  const now = Math.floor(Date.now() / 1000);
+  const tx = db.transaction((rows) => {
+    for (const entry of rows) {
+      const observedAt = Math.min(entry.observedAt, now);
+      const profile = stmts.entryUpdatedAt.get(entry.username);
+      if (profile && profile.updated_at >= observedAt) continue;
+      stmts.upsertNotFound.run({
+        username: entry.username,
+        observedAt,
+        expiresAt: observedAt + config.notFoundTtlSeconds
+      });
+    }
+  });
+  tx(entries);
+  incrMeta('total_contributions', entries.length);
+  if (entries.length) recordActivity({ contributionEntries: entries.length });
+  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run('last_updated', String(now));
+  return entries.length;
+}
+
 export function getStats() {
   return {
     totalEntries: stmts.count.get().n,
+    totalNotFoundEntries: db.prepare('SELECT COUNT(*) AS n FROM not_found_entries WHERE expires_at > ?')
+      .get(Math.floor(Date.now() / 1000)).n,
     totalContributions: Number(getMeta('total_contributions', '0')) || 0,
     lastUpdated: (() => {
       const v = getMeta('last_updated', null);
@@ -292,13 +395,18 @@ export function getHistory(period = '24h') {
   const buckets = period === '24h'
     ? db.prepare(`
       SELECT bucket, lookup_requests AS requests, lookup_hits AS hits,
-        lookup_misses AS misses, contribution_entries AS contributions
+        lookup_misses AS misses, lookup_not_found_hits AS notFoundHits,
+        lookup_rate_limited AS lookupRateLimited, contribute_rate_limited AS contributeRateLimited,
+        contribution_entries AS contributions
       FROM activity WHERE bucket >= ? ORDER BY bucket ASC
     `).all(start)
     : db.prepare(`
       SELECT (bucket / ?) * ? AS bucket,
         SUM(lookup_requests) AS requests, SUM(lookup_hits) AS hits,
-        SUM(lookup_misses) AS misses, SUM(contribution_entries) AS contributions
+        SUM(lookup_misses) AS misses, SUM(lookup_not_found_hits) AS notFoundHits,
+        SUM(lookup_rate_limited) AS lookupRateLimited,
+        SUM(contribute_rate_limited) AS contributeRateLimited,
+        SUM(contribution_entries) AS contributions
       FROM activity WHERE bucket >= ? GROUP BY (bucket / ?) * ? ORDER BY bucket ASC
     `).all(bucketSeconds, bucketSeconds, start, bucketSeconds, bucketSeconds);
   return {
@@ -312,6 +420,7 @@ export function getHistory(period = '24h') {
 export function cleanup(retentionDays) {
   const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400;
   const removed = stmts.deleteOlderThan.run(cutoff).changes;
+  db.prepare('DELETE FROM not_found_entries WHERE expires_at <= ?').run(Math.floor(Date.now() / 1000));
   db.prepare('DELETE FROM activity WHERE bucket < ?').run(Math.floor(Date.now() / 1000) - 90 * 86400);
   return removed;
 }
