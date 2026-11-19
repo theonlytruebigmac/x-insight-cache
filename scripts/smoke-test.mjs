@@ -10,9 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 
-const PORT = 8799;
 const API_KEY = 'test-key-' + Math.random().toString(36).slice(2);
-const BASE = `http://127.0.0.1:${PORT}`;
+const ADMIN_PASSWORD = 'admin-test-' + Math.random().toString(36).slice(2);
+let BASE;
 const dbDir = mkdtempSync(join(tmpdir(), 'xic-test-'));
 
 let pass = 0;
@@ -24,7 +24,10 @@ function check(name, cond) {
 
 function startServer(env) {
   return spawn('node', ['src/server.js'], {
-    env: { ...process.env, PORT: String(PORT), DB_PATH: join(dbDir, 'test.db'), API_KEY, RETENTION_DAYS: '60', ...env },
+    env: {
+      ...process.env, PORT: '0', DB_PATH: join(dbDir, 'test.db'), API_KEY, RETENTION_DAYS: '60',
+      ADMIN_USERNAME: 'admin', ADMIN_PASSWORD, ADMIN_SECURE_COOKIE: 'false', ...env
+    },
     stdio: ['ignore', 'pipe', 'pipe']
   });
 }
@@ -34,6 +37,7 @@ async function waitForServer(proc) {
     const timeout = setTimeout(() => reject(new Error('server did not start in time')), 5000);
     proc.stdout.on('data', (chunk) => {
       if (chunk.toString().includes('listening on')) {
+        BASE = `http://127.0.0.1:${chunk.toString().match(/listening on :(\d+)/)[1]}`;
         clearTimeout(timeout);
         resolve();
       }
@@ -59,17 +63,21 @@ async function req(method, path, { auth = API_KEY, body } = {}) {
 async function main() {
   console.log('=== fails to start without API_KEY ===');
   const noKey = spawn('node', ['src/server.js'], {
-    env: { ...process.env, PORT: '8800', DB_PATH: join(dbDir, 'nokey.db'), API_KEY: '' },
+    env: { ...process.env, PORT: '0', DB_PATH: join(dbDir, 'nokey.db'), API_KEY: '' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   const exitCode = await new Promise((resolve) => noKey.on('exit', resolve));
   check('exits non-zero with no API_KEY set', exitCode !== 0);
 
+  const partialAdmin = startServer({ ADMIN_PASSWORD: '' });
+  const partialExit = await new Promise((resolve) => partialAdmin.on('exit', resolve));
+  check('exits non-zero with incomplete admin configuration', partialExit !== 0);
+
   console.log('=== main server ===');
   const server = startServer({});
-  await waitForServer(server);
 
   try {
+    await waitForServer(server);
     // --- auth ---
     let r = await req('GET', '/lookup?users=espn', { auth: null });
     check('lookup without auth -> 401', r.status === 401);
@@ -134,8 +142,180 @@ async function main() {
     });
     check('contribute with __proto__ key does not throw -> 200', r.status === 200);
     check('global Object.prototype was not polluted', !({}).polluted);
+
+    console.log('=== dashboard ===');
+    let response = await fetch(BASE + '/');
+    check('root opens the dashboard', response.ok && response.url.endsWith('/admin/'));
+    const html = await response.text();
+    check('dashboard loads module script and has no embedded credentials',
+      html.includes('type="module"') && !html.includes(API_KEY) && !html.includes(ADMIN_PASSWORD));
+    check('dashboard has no-store and CSP headers',
+      response.headers.get('cache-control') === 'no-store' &&
+      response.headers.get('content-security-policy').includes("frame-ancestors 'none'"));
+    response = await fetch(BASE + '/admin/app.js');
+    check('dashboard JavaScript is served', response.ok && response.headers.get('content-type').includes('javascript'));
+    response = await fetch(BASE + '/admin/style.css');
+    check('dashboard stylesheet is served', response.ok && response.headers.get('content-type').includes('css'));
+    response = await fetch(BASE + '/admin/api/session', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{'
+    });
+    check('malformed dashboard JSON returns an explicit client error',
+      response.status === 400 && (await response.json()).error === 'Invalid JSON body.');
+
+    for (const path of ['session', 'stats', 'entries', 'export']) {
+      r = await req('GET', '/admin/api/' + path);
+      check(`API key cannot access dashboard ${path}`, r.status === 401);
+    }
+
+    const login = (body, headers = {}) => fetch(BASE + '/admin/api/session', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body)
+    });
+    response = await login({ username: 'admin', password: 'wrong' });
+    check('wrong admin password rejected', response.status === 401 && !response.headers.get('set-cookie'));
+    response = await login({ username: 'admin', password: ADMIN_PASSWORD }, { origin: 'https://other.invalid' });
+    check('cross-origin login rejected', response.status === 403);
+    response = await login({ username: 'admin', password: ADMIN_PASSWORD }, { origin: BASE });
+    const setCookie = response.headers.get('set-cookie') || '';
+    const cookie = setCookie.split(';')[0];
+    check('admin can log in with a scoped HttpOnly SameSite cookie',
+      response.ok && setCookie.includes('HttpOnly') && setCookie.includes('SameSite=Strict') && setCookie.includes('Path=/admin'));
+    const adminReq = (path, options = {}) => fetch(BASE + '/admin/api/' + path, {
+      ...options, headers: { cookie, 'content-type': 'application/json', ...options.headers }
+    });
+    response = await adminReq('session');
+    check('session authenticates admin', response.ok && (await response.json()).username === 'admin');
+    response = await fetch(BASE + '/stats', { headers: { cookie } });
+    check('admin session cannot replace extension API key', response.status === 401);
+    response = await adminReq('stats');
+    const stats = await response.json();
+    check('dashboard stats include storage, contributions, retention and uptime',
+      response.ok && stats.totalEntries === 3 && stats.totalContributions === 4 &&
+      stats.retentionDays === 60 && Number.isInteger(stats.uptimeSeconds));
+    response = await adminReq('breakdowns');
+    const breakdowns = await response.json();
+    check('breakdowns report populated devices and locations',
+      response.ok && breakdowns.devices.some((item) => item.name === 'Web') &&
+      breakdowns.locations.some((item) => item.name === 'Fakeland'));
+    response = await adminReq('history?period=24h');
+    const history = await response.json();
+    check('lookup history contains aggregate requests, hits and misses',
+      response.ok && history.period === '24h' &&
+      history.buckets.reduce((sum, item) => sum + item.requests, 0) > 0 &&
+      history.buckets.reduce((sum, item) => sum + item.hits, 0) > 0 &&
+      history.buckets.reduce((sum, item) => sum + item.misses, 0) > 0);
+    for (const period of ['7d', '30d']) {
+      response = await adminReq('history?period=' + period);
+      const daily = await response.json();
+      check(`${period} history has daily buckets`, response.ok && daily.bucketSeconds === 86400);
+    }
+    response = await adminReq('history?period=year');
+    check('invalid history period rejected', response.status === 400);
+    response = await adminReq('entries?pageSize=2');
+    const first = await response.json();
+    response = await adminReq('entries?pageSize=2&page=2');
+    const second = await response.json();
+    check('entries paginate with stable ordering and totals',
+      first.total === 3 && first.entries.length === 2 && second.entries.length === 1 &&
+      !first.entries.some((entry) => entry.username === second.entries[0].username));
+    const espn = [...first.entries, ...second.entries].find((entry) => entry.username === 'espn');
+    check('dashboard exposes full cached fields without changing values',
+      espn.location === 'Fakeland' && espn.created_at === 1174941976 &&
+      espn.username_changes === 0 && typeof espn.updated_at === 'number');
+    response = await adminReq('entries?device=iOS&accurate=yes&sort=username&direction=asc');
+    const filtered = await response.json();
+    check('device, accuracy and sorting filters apply',
+      response.ok && filtered.total === 1 && filtered.entries[0].username === 'nfl');
+    for (const term of ['ESPN', 'Fakeland', 'iOS', '123456']) {
+      response = await adminReq('entries?search=' + encodeURIComponent(term));
+      const data = await response.json();
+      check(`search matches ${term}`, response.ok && data.total === 1);
+    }
+    for (const term of ['%', '_', "' OR 1=1 --", 'doesnotexist']) {
+      response = await adminReq('entries?search=' + encodeURIComponent(term));
+      check(`search treats ${term} literally`, response.ok && (await response.json()).total === 0);
+    }
+    for (const query of ['page=0', 'page=1.5', 'pageSize=101', 'search[]=x', 'search=' + 'a'.repeat(101)]) {
+      response = await adminReq('entries?' + query);
+      check(`invalid pagination/search rejected: ${query.slice(0, 25)}`, response.status === 400);
+    }
+    response = await adminReq('entries', { method: 'DELETE' });
+    check('dashboard cannot delete cache entries', response.status === 404);
+    response = await adminReq('keys', { method: 'POST', body: JSON.stringify({ name: 'Test extension' }) });
+    const generatedKey = await response.json();
+    check('admin can create a high-entropy individually labeled key',
+      response.status === 201 && generatedKey.name === 'Test extension' &&
+      generatedKey.token.startsWith('xic_') && generatedKey.token.length > 40);
+    response = await adminReq('keys');
+    let keyList = await response.json();
+    check('key listing exposes prefix but never full token',
+      response.ok && keyList.keys.length === 1 && !JSON.stringify(keyList).includes(generatedKey.token));
+    response = await fetch(BASE + '/lookup?users=espn', {
+      headers: { authorization: `Bearer ${generatedKey.token}` }
+    });
+    check('generated key works with the extension API', response.status === 200);
+    response = await adminReq('keys');
+    keyList = await response.json();
+    check('managed key records last-use time', typeof keyList.keys[0].lastUsedAt === 'number');
+    response = await adminReq('keys/' + encodeURIComponent(generatedKey.id), { method: 'DELETE' });
+    check('admin can revoke managed key', response.ok);
+    response = await fetch(BASE + '/lookup?users=espn', {
+      headers: { authorization: `Bearer ${generatedKey.token}` }
+    });
+    check('revoked key no longer authenticates requests', response.status === 401);
+    response = await adminReq('keys', { method: 'POST', body: JSON.stringify({ name: '' }) });
+    check('invalid managed-key label rejected', response.status === 400);
+
+    r = await req('POST', '/contribute', {
+      body: { entries: { formula: { l: '=1+2', d: 'Web' } } }
+    });
+    check('formula-like cache field can be contributed for CSV escaping test', r.status === 200);
+    response = await adminReq('export?format=csv');
+    const csv = await response.text();
+    check('CSV export neutralizes formula-leading fields',
+      response.ok && csv.includes("'=1+2") && response.headers.get('content-disposition').includes('.csv'));
+    response = await adminReq('export?format=json');
+    const exportedEntries = await response.json();
+    check('JSON export contains cached fields', response.ok && exportedEntries.some((entry) => entry.username === 'formula'));
+    response = await adminReq('export?format=xml');
+    check('unsupported export format rejected', response.status === 400);
+    response = await adminReq('session', { method: 'DELETE', headers: { origin: 'https://other.invalid' } });
+    check('cross-origin logout rejected', response.status === 403);
+    response = await adminReq('session', { method: 'DELETE' });
+    check('logout clears cookie', response.ok && response.headers.get('set-cookie').includes('Expires=Thu, 01 Jan 1970'));
+    response = await adminReq('entries');
+    check('logged-out session cannot be reused', response.status === 401);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      response = await login({ username: 'admin', password: 'wrong' });
+    }
+    check('dashboard login is rate limited', response.status === 429 && (await response.json()).error.includes('Too many'));
   } finally {
     server.kill();
+    await new Promise((resolve) => server.once('close', resolve));
+  }
+
+  const disabled = startServer({ ADMIN_USERNAME: '', ADMIN_PASSWORD: '' });
+  try {
+    await waitForServer(disabled);
+    const response = await fetch(BASE + '/admin/api/session');
+    check('dashboard stays disabled without admin credentials', response.status === 503);
+    const r = await req('GET', '/stats');
+    check('extension API still works with dashboard disabled', r.status === 200);
+  } finally {
+    disabled.kill();
+    await new Promise((resolve) => disabled.once('close', resolve));
+  }
+
+  const secure = startServer({ ADMIN_SECURE_COOKIE: 'true' });
+  try {
+    await waitForServer(secure);
+    const response = await fetch(BASE + '/admin/api/session', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: ADMIN_PASSWORD })
+    });
+    check('production session cookie has Secure flag', response.headers.get('set-cookie')?.includes('; Secure;'));
+  } finally {
+    secure.kill();
+    await new Promise((resolve) => secure.once('close', resolve));
   }
 
   console.log('\n=== retention cleanup (direct unit test, not real time) ===');

@@ -18,6 +18,9 @@ export const config = {
   port: int('PORT', 8787),
   dbPath: process.env.DB_PATH || './data/cache.db',
   apiKey: process.env.API_KEY || null,
+  adminUsername: process.env.ADMIN_USERNAME || null,
+  adminPassword: process.env.ADMIN_PASSWORD || null,
+  adminSecureCookie: process.env.ADMIN_SECURE_COOKIE !== 'false',
 
   retentionDays: int('RETENTION_DAYS', 60),
   cleanupIntervalMs: int('CLEANUP_INTERVAL_MS', 60 * 60 * 1000), // hourly

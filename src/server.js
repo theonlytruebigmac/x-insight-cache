@@ -16,7 +16,8 @@ import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
 import { requireApiKey } from './auth.js';
 import { parseUsersParam, parseContributeBody } from './validate.js';
-import { getMany, upsertMany, getStats, cleanup } from './db.js';
+import { getMany, upsertMany, getStats, cleanup, recordActivity } from './db.js';
+import admin from './admin.js';
 
 if (!config.apiKey) {
   console.error(
@@ -28,8 +29,14 @@ if (!config.apiKey) {
 }
 
 const app = express();
+if (!!config.adminUsername !== !!config.adminPassword) {
+  console.error('FATAL: Set both ADMIN_USERNAME and ADMIN_PASSWORD to enable the dashboard, or leave both unset.');
+  process.exit(1);
+}
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
+app.get('/', (req, res) => res.redirect('/admin/'));
+app.use('/admin', admin);
 
 app.use(
   '/lookup',
@@ -48,6 +55,11 @@ app.get('/lookup', requireApiKey, (req, res) => {
   }
 
   const rows = getMany(parsed.usernames);
+  recordActivity({
+    lookupRequests: 1,
+    lookupHits: parsed.usernames.filter((username) => rows.has(username)).length,
+    lookupMisses: parsed.usernames.filter((username) => !rows.has(username)).length
+  });
   const results = {};
   const misses = [];
 
@@ -93,6 +105,11 @@ app.use((req, res) => {
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
+  if (req.path.startsWith('/admin/') && (err.status === 400 || err.status === 413)) {
+    console.warn('Rejected dashboard JSON request:', err.status);
+    res.status(err.status).json({ error: err.status === 413 ? 'Request body too large.' : 'Invalid JSON body.' });
+    return;
+  }
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'internal error' });
 });
@@ -104,6 +121,6 @@ setInterval(() => {
   if (n) console.log(`Cleanup: removed ${n} entries older than ${config.retentionDays} days`);
 }, config.cleanupIntervalMs);
 
-app.listen(config.port, () => {
-  console.log(`x-insight-cache listening on :${config.port} (retention: ${config.retentionDays}d)`);
+const server = app.listen(config.port, () => {
+  console.log(`x-insight-cache listening on :${server.address().port} (retention: ${config.retentionDays}d)`);
 });

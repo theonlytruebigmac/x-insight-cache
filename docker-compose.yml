@@ -15,13 +15,8 @@ services:
       traefik.http.routers.x-insight-cache-rtr.rule: Host(`${CACHE_FQDN:-feed.syschimp.com}`)
       traefik.http.routers.x-insight-cache-rtr.service: x-insight-cache-service
       traefik.http.services.x-insight-cache-service.loadbalancer.server.port: 8787
-      # No chain-oauth@file here on purpose -- see the README's "Behind
-      # Traefik" section. This is a JSON API called by the extension's
-      # background script with a Bearer token, not something a human signs
-      # into through a browser; an OAuth redirect chain would break every
-      # request rather than protect it. The API key is this service's auth.
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     networks:
       t3_proxy:
     volumes:

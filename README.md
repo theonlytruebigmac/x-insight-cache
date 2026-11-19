@@ -55,6 +55,53 @@ Data persists in the `cache-data` volume. Retention defaults to 60 days
 (matching upstream) and is enforced by an hourly sweep, not a database-level
 TTL — SQLite doesn't have one, unlike the Cloudflare KV store upstream used.
 
+### Dashboard
+
+Visit `/` or `/admin/` on your server to open the read-only dashboard. Enable
+login by setting both of these in `.env`, then recreate the container with
+`docker compose up -d --build`:
+
+```dotenv
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=replace-with-a-long-random-password
+ADMIN_SECURE_COOKIE=true
+```
+
+Generate a password using the command in the deployment section; do not reuse
+the extension's `API_KEY`. The existing Compose `env_file` passes these settings
+to the server. No frontend build or additional service is needed.
+
+The dashboard shows cached account counts, lifetime accepted contributions
+(including updates), retention, last contribution time and server uptime.
+Browse all stored fields in a paginated table, or search by handle, location,
+device, affiliation or account ID. Cache data is read-only; the dashboard
+does not record who looked up whom.
+
+The dashboard also includes filters, sort, CSV/JSON export, API-key management,
+freshness counts, device/location breakdowns, and aggregate usage charts.
+Activity history begins when this server version is deployed; older lookup and
+contribution events cannot be reconstructed from the cache database.
+Managed extension keys have the same read/write permissions as `API_KEY`.
+Only the key hash is stored; the complete key appears only once at creation.
+Use individual labels to track key ownership, and revoke a key immediately if
+it is lost or no longer needed. Removing a key does not revoke the configured
+shared `API_KEY`.
+
+Dashboard credentials are separate from the shared extension API key.
+Login creates an HttpOnly, SameSite=Strict cookie valid for eight hours.
+Sessions are held in memory: logout invalidates that session, and restarting
+the server invalidates all sessions (including when rotating credentials).
+Login attempts are limited to 10 per IP per 15 minutes. Behind a proxy,
+clients may share this limit because forwarded IP headers are not trusted.
+
+**Use HTTPS in production.** Session cookies have `Secure` enabled by default,
+including behind Traefik. For local HTTP testing only, set
+`ADMIN_SECURE_COOKIE=false`; otherwise a browser may not retain the cookie.
+Leave both admin credentials unset to disable dashboard access to data.
+Setting only one is a startup error. The extension API and its bearer-token
+authentication are unchanged; dashboard cookies cannot authenticate API calls,
+and API keys cannot authenticate dashboard calls.
+
 ### Behind Traefik
 
 `docker-compose.yml` matches the `-rtr`/`-service` label convention and
@@ -72,25 +119,33 @@ would break every request from the extension rather than add protection.
 The API key is this service's actual auth; adding the OAuth chain here
 wouldn't secure it further, it would just make it stop working.
 
-A direct `ports: "8787:8787"` mapping is kept alongside Traefik, matching
-the existing pattern — the app's own API-key check applies either way, so
-there's no added exposure from also reaching it directly on the host.
+The direct port is bound to `127.0.0.1:8787` for access from the Docker
+host only. Use the HTTPS Traefik URL from other machines; publishing the
+HTTP port on all interfaces would expose dashboard passwords and bearer
+tokens in transit. Firewall the port as well: older Docker releases may
+allow hosts on the same network segment to reach localhost-published ports.
 
 ### Without Traefik
 
-Delete the `labels:` and `networks:` blocks and add back:
+Delete the `labels:` and `networks:` blocks. Keep the loopback-only port:
 ```yaml
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
 ```
-Put your own reverse proxy (or none, on a private network) in front for TLS.
+Put your own HTTPS reverse proxy in front for access from other machines.
 
 ## Security model
 
-- **One shared key, not per-user accounts.** Simple by design — good for
-  "a defined group I've handed a key to," not meant to scale past that.
-  Rotate it by changing `API_KEY` and restarting; every client needs the
-  new value.
+- **Extension credentials.** The configured `API_KEY` remains a shared key.
+  The admin API can also issue individually revocable keys; each
+  key has the same read/write permissions as `API_KEY`. Rotating the shared
+  key does not revoke separately issued keys. Key-management controls in the
+  dashboard require an authenticated admin session.
+- **Separate admin login.** Optional dashboard credentials do not grant
+  extension API access. Cached account data is read-only in the dashboard,
+  but the admin API can create and revoke extension keys. Dashboard access
+  requires an expiring session; cross-site login/logout requests are rejected
+  and login is rate-limited.
 - **Server-side validation independent of the client.** Username format,
   batch-size caps, field-length caps, and account-ID/creation-date sanity
   checks are all re-checked here (`src/validate.js`), not trusted from the
@@ -107,11 +162,13 @@ Put your own reverse proxy (or none, on a private network) in front for TLS.
 
 ## What's actually stored
 
-Exactly the fields in the table above, keyed by handle — the same subset
-upstream's cache carried, already public on the account's own profile.
-Nothing about *you* (the person running or using the extension) is sent:
-no identity, no browsing history, no record of who looked up whom, beyond
-whatever your reverse proxy's own access logs capture.
+The cache contains the fields in the table above, keyed by handle — the same
+subset upstream's cache carried, already public on the account's profile.
+The database also stores hourly aggregate lookup and contribution counts and,
+for managed API keys, an administrator-supplied label, key prefix, key hash,
+creation time and last-use time. It does not record who looked up whom or
+individual lookup history; your reverse proxy may keep its own access logs.
+Entry retention does not currently delete aggregate counts or managed keys.
 
 ## Testing
 
@@ -122,14 +179,18 @@ npm test
 Starts a real server against a temp SQLite file and exercises every endpoint
 over actual HTTP: auth rejection, server-side validation limits, malformed
 entries inside a valid batch, stats accumulation, prototype-pollution safety,
-and a direct unit test of the retention sweep. 23 checks, all passing as of
-the last run.
+and a direct unit test of the retention sweep. Also covers dashboard sessions,
+login rate limiting, cookie flags, cross-site rejection, read-only access,
+search and pagination. Tests use an OS-assigned port and temporary databases.
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `API_KEY` | *(required)* | Shared bearer token. Server refuses to start without it. |
+| `ADMIN_USERNAME` | *(unset)* | Dashboard username. Set with `ADMIN_PASSWORD` to enable dashboard data access. |
+| `ADMIN_PASSWORD` | *(unset)* | Dashboard password, separate from `API_KEY`. |
+| `ADMIN_SECURE_COOKIE` | `true` | Require HTTPS for dashboard cookies. Set to `false` only for local HTTP. |
 | `PORT` | `8787` | Listen port. |
 | `DB_PATH` | `./data/cache.db` | SQLite file path. |
 | `RETENTION_DAYS` | `60` | Entries older than this are swept hourly. |

@@ -7,8 +7,9 @@
  */
 import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
+import { useApiKey } from './db.js';
 
-function safeEqual(a, b) {
+export function safeEqual(a, b) {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
   // timingSafeEqual throws on length mismatch rather than returning false,
@@ -21,7 +22,8 @@ function safeEqual(a, b) {
 export function requireApiKey(req, res, next) {
   const header = req.get('authorization') || '';
   const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token || !safeEqual(token, config.apiKey)) {
+  if (scheme !== 'Bearer' || !token ||
+      (!safeEqual(token, config.apiKey) && !useApiKey(token))) {
     res.status(401).json({ error: 'missing or invalid API key' });
     return;
   }

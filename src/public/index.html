@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>X Insight Cache</title>
+  <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/app.js" type="module"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/admin/"><span class="brand-icon" aria-hidden="true">xi</span> X Insight <span class="muted">/ Cache</span></a>
+    <span class="tag">SELF-HOSTED</span>
+  </header>
+  <main>
+    <p id="notice" class="notice" role="status" hidden></p>
+    <section id="login-view" class="login-panel" hidden aria-labelledby="login-title">
+      <span class="eyebrow">YOUR CACHE, UNDER YOUR CONTROL</span>
+      <h1 id="login-title">Welcome back.</h1>
+      <p class="muted">Sign in to explore your community cache.</p>
+      <form id="login-form">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required maxlength="256">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button id="login-button" class="primary" type="submit">Sign in</button>
+      </form>
+      <p class="small muted">Admin access only. Extension API keys cannot be used here.</p>
+    </section>
+
+    <section id="dashboard-view" hidden aria-labelledby="dashboard-title">
+      <div class="page-heading">
+        <div><span class="eyebrow">CACHE EXPLORER</span><h1 id="dashboard-title">A little more insight.</h1><p class="muted">An overview of the public account metadata your community is caching.</p></div>
+        <div class="actions"><button id="refresh" type="button">Refresh data</button><button id="logout" type="button" class="quiet">Sign out</button></div>
+      </div>
+      <div class="metrics">
+        <article class="metric"><span class="metric-label">Cached accounts</span><strong id="total-entries">-</strong><span class="muted small">Entries currently stored</span></article>
+        <article class="metric"><span class="metric-label">Total contributions</span><strong id="total-contributions">-</strong><span class="muted small">Accepted entries, including updates</span></article>
+        <article class="metric"><span class="metric-label">Retention window</span><strong id="retention">-</strong><span class="muted small">Since the last contribution to an entry</span></article>
+        <article class="metric"><span class="metric-label">API cache hit rate</span><strong id="hit-rate">-</strong><span id="hit-rate-caption" class="muted small">Since metrics collection began</span></article>
+      </div>
+      <div class="activity"><span>Last contribution <strong id="last-updated">-</strong></span><span>Server uptime <strong id="uptime">-</strong></span></div>
+      <section class="insights-grid" aria-label="Cache insights">
+        <article class="data-panel insights-panel">
+          <div class="panel-heading"><div><h2>Cache freshness</h2><p id="freshness-caption" class="muted small"></p></div><span class="tag">RETENTION</span></div>
+          <div class="freshness-counts"><button id="expiring-link" class="freshness-count" type="button" disabled><strong id="expiring-count">-</strong><span>Near expiry</span></button><button id="expired-link" class="freshness-count" type="button" disabled><strong id="expired-count">-</strong><span>Past retention</span></button></div>
+        </article>
+        <article class="data-panel insights-panel"><div class="panel-heading"><div><h2>Devices</h2><p class="muted small">Most common cached device types</p></div></div><ol id="device-breakdown" class="breakdown-list"><li>Not available yet</li></ol></article>
+        <article class="data-panel insights-panel"><div class="panel-heading"><div><h2>Locations</h2><p class="muted small">Most common cached locations</p></div></div><ol id="location-breakdown" class="breakdown-list"><li>Not available yet</li></ol></article>
+      </section>
+      <section class="data-panel trends-panel" aria-labelledby="trends-title">
+        <div class="panel-heading"><div><h2 id="trends-title">Cache activity</h2><p class="muted small">Aggregate trends only. No handles or client IP addresses are recorded. Tracking starts with this server version.</p></div><label class="period-control small muted" for="history-period">Time range <select id="history-period"><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option></select></label></div>
+        <div class="charts-grid">
+          <article class="chart-card"><h3>Lookup activity</h3><div class="chart-legend"><span><i class="legend-dot lookup"></i>Requests</span><span><i class="legend-dot hit"></i>Hits</span><span><i class="legend-dot miss"></i>Misses</span></div><svg id="lookup-chart" viewBox="0 0 640 220" role="img" aria-label="Cache lookup requests, hits and misses over time"><text x="320" y="110" text-anchor="middle" class="chart-empty">Not available yet</text></svg></article>
+          <article class="chart-card"><h3>Contributions</h3><div class="chart-legend"><span><i class="legend-dot contribution"></i>Entries contributed</span></div><svg id="contribution-chart" viewBox="0 0 640 220" role="img" aria-label="Cache contributions over time"><text x="320" y="110" text-anchor="middle" class="chart-empty">Not available yet</text></svg></article>
+        </div>
+      </section>
+      <section class="data-panel" aria-labelledby="entries-title">
+        <div class="panel-heading"><div><h2 id="entries-title">Cached accounts</h2><p class="muted small">Read-only access. Select and copy any value to inspect it.</p></div><div class="actions"><button id="export-csv" type="button">Export CSV</button><button id="export-json" type="button">Export JSON</button><span class="tag">SQLITE</span></div></div>
+        <form id="search-form" class="search-bar">
+          <label class="sr-only" for="search">Search cached accounts</label>
+          <input id="search" type="search" placeholder="Search handles, locations, devices, affiliations or account IDs..." maxlength="100">
+          <button type="submit">Search</button>
+          <label for="device-filter" class="small muted">Device</label><select id="device-filter"><option value="">All devices</option></select>
+          <label for="accuracy-filter" class="small muted">Location</label><select id="accuracy-filter"><option value="">Any accuracy</option><option value="yes">Accurate</option><option value="no">Approximate</option></select>
+          <label for="freshness-filter" class="small muted">Freshness</label><select id="freshness-filter"><option value="">Any age</option><option value="fresh">Fresh</option><option value="expiring">Near expiry</option><option value="expired">Past retention</option></select>
+          <label for="sort-filter" class="small muted">Sort</label><select id="sort-filter"><option value="updated:desc">Recently cached</option><option value="updated:asc">Least recent</option><option value="username:asc">Handle A-Z</option><option value="username:desc">Handle Z-A</option><option value="location:asc">Location A-Z</option><option value="device:asc">Device A-Z</option><option value="created:asc">Oldest account</option><option value="created:desc">Newest account</option></select>
+          <label for="page-size" class="small muted">Per page</label>
+          <select id="page-size"><option>25</option><option>50</option><option>100</option></select>
+        </form>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Cached account data">
+          <table>
+            <thead><tr><th scope="col">Handle</th><th scope="col">Location</th><th scope="col">Device</th><th scope="col">Accurate location</th><th scope="col">Affiliation</th><th scope="col">Account ID</th><th scope="col">Account created</th><th scope="col">Handle changes</th><th scope="col">Last cached</th><th scope="col">Details</th></tr></thead>
+            <tbody id="entries"></tbody>
+          </table>
+        </div>
+        <p id="empty" class="empty" hidden>No cached accounts yet. Contributions from your extension will appear here.</p>
+        <div class="pagination"><span id="results-label" class="small muted" aria-live="polite"></span><div class="actions"><button id="previous" type="button">Previous</button><span id="page-label" class="small"></span><button id="next" type="button">Next</button></div></div>
+      </section>
+      <section class="data-panel keys-panel" aria-labelledby="keys-title">
+        <div class="panel-heading"><div><h2 id="keys-title">Extension API keys</h2><p class="muted small">Issue separate keys for people using your extension, and revoke them individually.</p></div><span id="active-key-count" class="tag">0 KEYS</span></div>
+        <form id="key-form" class="key-form"><label class="sr-only" for="key-name">Key label</label><input id="key-name" maxlength="60" placeholder="Key label (for example: Alex's extension)" required><button class="primary" type="submit">Generate API key</button></form>
+        <div id="new-key" class="new-key" hidden><div><strong>Copy this key now</strong><p class="muted small">It will only be shown once. Share it privately with the extension user.</p></div><code id="new-key-value"></code><button id="copy-key" type="button">Copy key</button></div>
+        <p id="key-notice" class="key-notice" role="status" hidden></p>
+        <div class="table-wrap key-table-wrap"><table><thead><tr><th scope="col">Label</th><th scope="col">Key prefix</th><th scope="col">Created</th><th scope="col">Last used</th><th scope="col">Action</th></tr></thead><tbody id="api-keys"></tbody></table></div>
+        <p id="no-keys" class="empty" hidden>No individually managed keys yet. The configured server API key will continue to work.</p>
+      </section>
+      <div class="preferences">
+        <label for="auto-refresh" class="small muted">Auto-refresh <select id="auto-refresh"><option value="0">Off</option><option value="30">Every 30 seconds</option><option value="60">Every minute</option><option value="300">Every 5 minutes</option></select></label>
+      </div>
+      <footer><span>Community-owned infrastructure. Read-only dashboard.</span><span id="refreshed"></span></footer>
+    </section>
+  </main>
+  <dialog id="entry-dialog" class="entry-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-heading"><div><span class="eyebrow">CACHED ACCOUNT</span><h2 id="dialog-title"></h2></div><button id="close-dialog" type="button" class="quiet" aria-label="Close account details">Close</button></div>
+    <dl id="detail-list" class="detail-list"></dl>
+  </dialog>
+</body>
+</html>
