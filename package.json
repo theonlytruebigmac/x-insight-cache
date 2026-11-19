@@ -1,0 +1,24 @@
+{
+  "name": "x-insight-cache",
+  "version": "0.1.0",
+  "description": "Self-hosted, API-key-gated community cache server for the x-account-insight browser extension. Not affiliated with x-account-location-device or its author.",
+  "type": "module",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true
+  }
+}

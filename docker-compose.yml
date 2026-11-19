@@ -1,0 +1,33 @@
+services:
+  cache:
+    build: .
+    restart: unless-stopped
+    environment:
+      API_KEY: ${API_KEY:?set API_KEY in .env before starting}
+      RETENTION_DAYS: ${RETENTION_DAYS:-60}
+    volumes:
+      - cache-data:/app/data
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.x-insight-cache.rule=Host(`${CACHE_FQDN:-feed.syschimp.com}`)
+      - traefik.http.routers.x-insight-cache.entrypoints=websecure
+      - traefik.http.routers.x-insight-cache.tls=true
+      # Set this to your actual Traefik certresolver name (e.g. from your
+      # Traefik static config) -- the placeholder below will not issue a
+      # real certificate.
+      - traefik.http.routers.x-insight-cache.tls.certresolver=letsencrypt
+      - traefik.http.services.x-insight-cache.loadbalancer.server.port=8787
+    # No `ports:` mapping on purpose -- Traefik is the only intended
+    # entrypoint. The app's own API-key check still applies either way,
+    # but there's no reason to also expose it directly on the host.
+
+networks:
+  traefik:
+    # Must already exist and be the network your Traefik container is
+    # attached to. Create it once with: docker network create traefik
+    external: true
+
+volumes:
+  cache-data:
