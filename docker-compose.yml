@@ -1,32 +1,34 @@
 services:
-  cache:
+  x-insight-cache:
+    container_name: x-insight-cache
     build: .
     restart: unless-stopped
+    hostname: x-insight-cache
     environment:
       API_KEY: ${API_KEY:?set API_KEY in .env before starting}
       RETENTION_DAYS: ${RETENTION_DAYS:-60}
+    env_file:
+      - .env
+    labels:
+      traefik.enable: true
+      traefik.http.routers.x-insight-cache-rtr.entrypoints: websecure
+      traefik.http.routers.x-insight-cache-rtr.rule: Host(`${CACHE_FQDN:-feed.syschimp.com}`)
+      traefik.http.routers.x-insight-cache-rtr.service: x-insight-cache-service
+      traefik.http.services.x-insight-cache-service.loadbalancer.server.port: 8787
+      # No chain-oauth@file here on purpose -- see the README's "Behind
+      # Traefik" section. This is a JSON API called by the extension's
+      # background script with a Bearer token, not something a human signs
+      # into through a browser; an OAuth redirect chain would break every
+      # request rather than protect it. The API key is this service's auth.
+    ports:
+      - "8787:8787"
+    networks:
+      t3_proxy:
     volumes:
       - cache-data:/app/data
-    networks:
-      - traefik
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.x-insight-cache.rule=Host(`${CACHE_FQDN:-feed.syschimp.com}`)
-      - traefik.http.routers.x-insight-cache.entrypoints=websecure
-      - traefik.http.routers.x-insight-cache.tls=true
-      # Set this to your actual Traefik certresolver name (e.g. from your
-      # Traefik static config) -- the placeholder below will not issue a
-      # real certificate.
-      - traefik.http.routers.x-insight-cache.tls.certresolver=letsencrypt
-      - traefik.http.services.x-insight-cache.loadbalancer.server.port=8787
-    # No `ports:` mapping on purpose -- Traefik is the only intended
-    # entrypoint. The app's own API-key check still applies either way,
-    # but there's no reason to also expose it directly on the host.
 
 networks:
-  traefik:
-    # Must already exist and be the network your Traefik container is
-    # attached to. Create it once with: docker network create traefik
+  t3_proxy:
     external: true
 
 volumes:

@@ -57,22 +57,24 @@ TTL — SQLite doesn't have one, unlike the Cloudflare KV store upstream used.
 
 ### Behind Traefik
 
-`docker-compose.yml` ships with Traefik labels already, routing
-`feed.syschimp.com` (set `CACHE_FQDN` in `.env` to override) with TLS via a
-cert resolver. Two things to set before it'll actually work:
+`docker-compose.yml` matches the `-rtr`/`-service` label convention and
+`t3_proxy` network already used elsewhere in this deployment, routing
+`feed.syschimp.com` (set `CACHE_FQDN` in `.env` to override). No TLS/
+certresolver labels are set here — this setup's `websecure` entrypoint
+already has a default resolver configured in Traefik's own static config,
+same as the other services on `t3_proxy`.
 
-1. **The external network.** The compose file expects a Docker network
-   named `traefik` that your Traefik container is already attached to.
-   Create it once if it doesn't exist: `docker network create traefik`.
-   If your Traefik setup uses a different network name, change the
-   `networks:` block at the bottom of `docker-compose.yml` to match.
-2. **The cert resolver name.** `tls.certresolver=letsencrypt` is a
-   placeholder — set it to whatever resolver name is actually defined in
-   your Traefik static config, or no certificate will be issued.
+**No `chain-oauth@file` middleware on this one, unlike some other services
+behind the same Traefik.** This is a JSON API that the extension's
+background script calls directly with `Authorization: Bearer <key>` — an
+OAuth redirect chain is built for a human signing in through a browser, and
+would break every request from the extension rather than add protection.
+The API key is this service's actual auth; adding the OAuth chain here
+wouldn't secure it further, it would just make it stop working.
 
-There's deliberately no `ports:` mapping — Traefik is meant to be the only
-entrypoint. The app's own API-key check still applies regardless, but
-there's no reason to also expose the raw port on the host.
+A direct `ports: "8787:8787"` mapping is kept alongside Traefik, matching
+the existing pattern — the app's own API-key check applies either way, so
+there's no added exposure from also reaching it directly on the host.
 
 ### Without Traefik
 
