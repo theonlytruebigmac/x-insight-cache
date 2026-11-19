@@ -401,13 +401,14 @@ export function getHistory(period = '24h') {
       FROM activity WHERE bucket >= ? ORDER BY bucket ASC
     `).all(start)
     : db.prepare(`
-      SELECT (bucket / ?) * ? AS bucket,
+      SELECT (bucket / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket,
         SUM(lookup_requests) AS requests, SUM(lookup_hits) AS hits,
         SUM(lookup_misses) AS misses, SUM(lookup_not_found_hits) AS notFoundHits,
         SUM(lookup_rate_limited) AS lookupRateLimited,
         SUM(contribute_rate_limited) AS contributeRateLimited,
         SUM(contribution_entries) AS contributions
-      FROM activity WHERE bucket >= ? GROUP BY (bucket / ?) * ? ORDER BY bucket ASC
+      FROM activity WHERE bucket >= ?
+      GROUP BY (bucket / CAST(? AS INTEGER)) * CAST(? AS INTEGER) ORDER BY bucket ASC
     `).all(bucketSeconds, bucketSeconds, start, bucketSeconds, bucketSeconds);
   return {
     period,

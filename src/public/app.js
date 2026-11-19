@@ -1,3 +1,5 @@
+import { renderChart } from './chart.js';
+
 const $ = (id) => document.getElementById(id);
 let page = 1;
 let search = '';
@@ -92,58 +94,6 @@ function renderBreakdown(id, items) {
     li.append(label, count);
     return li;
   }));
-}
-
-function renderChart(svg, history, series) {
-  const ns = 'http://www.w3.org/2000/svg';
-  const element = (name, attrs = {}) => {
-    const node = document.createElementNS(ns, name);
-    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
-    return node;
-  };
-  const width = 640, height = 220, left = 38, right = 12, top = 12, bottom = 30;
-  const plotWidth = width - left - right, plotHeight = height - top - bottom;
-  const count = history.period === '24h' ? 24 : history.period === '7d' ? 7 : 30;
-  const start = Math.floor(Date.now() / (history.bucketSeconds * 1000)) * history.bucketSeconds -
-    (count - 1) * history.bucketSeconds;
-  const buckets = new Map(history.buckets.map((bucket) => [bucket.bucket, bucket]));
-  const values = Array.from({ length: count }, (_, i) => buckets.get(start + i * history.bucketSeconds) || {});
-  const maximum = Math.max(1, ...values.flatMap((v) => series.map((line) => Number(v[line.field]) || 0)));
-  const hasData = values.some((v) => series.some((line) => Number(v[line.field]) > 0));
-  svg.replaceChildren();
-  for (let tick = 0; tick <= 4; tick++) {
-    const y = top + plotHeight * tick / 4;
-    const grid = element('line', { x1: left, y1: y, x2: width - right, y2: y, class: 'chart-gridline' });
-    const label = element('text', { x: left - 7, y: y + 3, 'text-anchor': 'end', class: 'chart-axis' });
-    label.textContent = number.format(Math.round(maximum * (4 - tick) / 4));
-    svg.append(grid, label);
-  }
-  if (!hasData) {
-    const empty = element('text', { x: width / 2, y: height / 2, 'text-anchor': 'middle', class: 'chart-empty' });
-    empty.textContent = 'Activity will appear here as requests arrive';
-    svg.append(empty);
-  } else {
-    for (const line of series) {
-      const points = values.map((value, i) => {
-        const x = left + plotWidth * i / (count - 1);
-        const y = top + plotHeight * (1 - (Number(value[line.field]) || 0) / maximum);
-        return `${x},${y}`;
-      });
-      svg.append(element('polyline', { points: points.join(' '), class: `chart-line series-${line.name}` }));
-    }
-  }
-  for (const i of [0, Math.floor((count - 1) / 2), count - 1]) {
-    const time = new Date((start + i * history.bucketSeconds) * 1000);
-    const label = element('text', {
-      x: left + plotWidth * i / (count - 1), y: height - 7,
-      'text-anchor': i === 0 ? 'start' : i === count - 1 ? 'end' : 'middle',
-      class: 'chart-axis'
-    });
-    label.textContent = history.period === '24h'
-      ? time.toLocaleTimeString([], { hour: 'numeric' })
-      : time.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    svg.append(label);
-  }
 }
 
 function showEntryDetails(entry, retentionDays) {
@@ -299,15 +249,15 @@ async function load() {
       $('device-filter').value = selectedDevice;
     }
     renderChart($('lookup-chart'), history, [
-      { field: 'requests', name: 'requests' },
-      { field: 'hits', name: 'hits' },
-      { field: 'notFoundHits', name: 'not-found' },
-      { field: 'misses', name: 'misses' },
-      { field: 'lookupRateLimited', name: 'rate-limited' }
+      { field: 'requests', name: 'requests', label: 'Requests' },
+      { field: 'hits', name: 'hits', label: 'Profile hits' },
+      { field: 'notFoundHits', name: 'not-found', label: 'Not found' },
+      { field: 'misses', name: 'misses', label: 'Misses' },
+      { field: 'lookupRateLimited', name: 'rate-limited', label: '429s' }
     ]);
     renderChart($('contribution-chart'), history, [
-      { field: 'contributions', name: 'contributions' },
-      { field: 'contributeRateLimited', name: 'rate-limited' }
+      { field: 'contributions', name: 'contributions', label: 'Entries contributed' },
+      { field: 'contributeRateLimited', name: 'rate-limited', label: '429s' }
     ]);
     renderEntries(data.entries, stats.retentionDays);
     $('empty').hidden = data.entries.length > 0;

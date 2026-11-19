@@ -100,6 +100,8 @@ The dashboard also includes filters, sort, CSV/JSON export, API-key management,
 freshness counts, device/location breakdowns, aggregate lookup hit/miss and
 not-found trends, and HTTP 429 counts for lookup and contribution requests.
 Activity is hourly and aggregate-only; it does not retain handles or client IPs.
+Charts use local time for hourly buckets and UTC for daily buckets; the current
+bucket is incomplete. Hover over a plotted point to see its count.
 Activity history begins when this server version is deployed; older lookup and
 contribution events cannot be reconstructed from the cache database.
 Managed extension keys have the same read/write permissions as `API_KEY`.

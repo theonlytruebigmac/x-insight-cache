@@ -223,10 +223,20 @@ async function main() {
       history.buckets.reduce((sum, item) => sum + item.requests, 0) > 0 &&
       history.buckets.reduce((sum, item) => sum + item.hits, 0) > 0 &&
       history.buckets.reduce((sum, item) => sum + item.misses, 0) > 0);
+    const sampleDay = Math.floor(Date.now() / 86400000) * 86400 - 2 * 86400;
+    const activityDb = new Database(join(dbDir, 'test.db'));
+    const insertActivity = activityDb.prepare('INSERT INTO activity (bucket, lookup_requests) VALUES (?, ?)');
+    insertActivity.run(sampleDay + 3600, 2);
+    insertActivity.run(sampleDay + 7200, 3);
+    activityDb.close();
     for (const period of ['7d', '30d']) {
       response = await adminReq('history?period=' + period);
       const daily = await response.json();
-      check(`${period} history has daily buckets`, response.ok && daily.bucketSeconds === 86400);
+      check(`${period} history combines hourly activity into UTC daily buckets`,
+        response.ok && daily.bucketSeconds === 86400 &&
+        daily.buckets.every((bucket) => bucket.bucket % 86400 === 0) &&
+        daily.buckets.filter((bucket) => bucket.bucket === sampleDay).length === 1 &&
+        daily.buckets.find((bucket) => bucket.bucket === sampleDay).requests === 5);
     }
     response = await adminReq('history?period=year');
     check('invalid history period rejected', response.status === 400);
