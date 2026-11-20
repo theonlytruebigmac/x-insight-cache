@@ -3,6 +3,9 @@ services:
     container_name: x-insight-cache
     build: .
     restart: unless-stopped
+    # tini as PID 1: forwards SIGTERM and reaps children, so `docker stop` is a
+    # clean shutdown rather than a 10s wait followed by SIGKILL.
+    init: true
     hostname: x-insight-cache
     environment:
       API_KEY: ${API_KEY:?set API_KEY in .env before starting}
