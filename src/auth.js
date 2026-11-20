@@ -1,29 +1,30 @@
 /**
- * Single shared-secret auth via `Authorization: Bearer <key>`.
+ * Bearer-token auth via `Authorization: Bearer <key>`.
  *
- * Deliberately simple — one key for the whole community, not per-user
- * accounts. Good enough for "a defined group I've shared a key with",
- * not meant to scale past that without real per-client credentials.
+ * Two kinds of credential are accepted: the shared API_KEY from the
+ * environment, and individually issued/revocable keys stored (hashed) in the
+ * database by the admin dashboard.
  */
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { useApiKey } from './db.js';
 
+/**
+ * Constant-time string comparison. Both inputs are hashed first so the
+ * comparison always runs over equal-length buffers: no early return on a length
+ * mismatch, so neither the content nor the length of the secret leaks via timing.
+ */
 export function safeEqual(a, b) {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  // timingSafeEqual throws on length mismatch rather than returning false,
-  // so pad to equal length first — the length check itself leaks via timing
-  // either way, but that's far less sensitive than the key content.
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const digest = (value) => createHash('sha256').update(String(value)).digest();
+  return timingSafeEqual(digest(a), digest(b));
 }
 
+// RFC 7235: the auth scheme is case-insensitive.
+const BEARER_RE = /^Bearer +(\S+)$/i;
+
 export function requireApiKey(req, res, next) {
-  const header = req.get('authorization') || '';
-  const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token ||
-      (!safeEqual(token, config.apiKey) && !useApiKey(token))) {
+  const token = BEARER_RE.exec(req.get('authorization') || '')?.[1];
+  if (!token || (!safeEqual(token, config.apiKey) && !useApiKey(token))) {
     res.status(401).json({ error: 'missing or invalid API key' });
     return;
   }

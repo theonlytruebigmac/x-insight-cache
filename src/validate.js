@@ -21,7 +21,8 @@ export function isValidUsername(u) {
 
 export function parseUsersParam(raw) {
   if (typeof raw !== 'string' || !raw) return { ok: false, error: 'missing users parameter' };
-  const usernames = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  // De-duplicate so a repeated handle isn't double-counted in hits/misses.
+  const usernames = [...new Set(raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean))];
   if (!usernames.length) return { ok: false, error: 'no usernames provided' };
   if (usernames.length > config.maxLookupUsers) {
     return { ok: false, error: `too many usernames (max ${config.maxLookupUsers})` };
@@ -30,16 +31,26 @@ export function parseUsersParam(raw) {
   return { ok: true, usernames };
 }
 
+// C0/C1 control characters (NUL, newlines, escape sequences, ...) have no place in
+// a location, device or affiliation label.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+
 function clampString(value) {
   if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return trimmed.slice(0, config.maxFieldLength);
+  // toWellFormed() replaces any lone surrogate in the input with U+FFFD.
+  let text = value.replace(CONTROL_CHARS_RE, ' ').toWellFormed().trim();
+  if (!text) return null;
+  text = text.slice(0, config.maxFieldLength);
+  // The cut can land between the halves of a surrogate pair (an emoji); drop the
+  // orphaned half rather than storing a malformed string.
+  if (/[\ud800-\udbff]$/.test(text)) text = text.slice(0, -1);
+  return text.trim() || null;
 }
 
 function observationTime(raw) {
   const nowSeconds = Math.floor(Date.now() / 1000);
-  if (raw.t === undefined) return nowSeconds;
+  // Absent or null means "no observation time supplied" (older clients): use now.
+  if (raw.t === undefined || raw.t === null) return nowSeconds;
   if (!Number.isInteger(raw.t) || raw.t < nowSeconds - config.retentionDays * 86400) return null;
   return Math.min(raw.t, nowSeconds);
 }
@@ -93,7 +104,10 @@ function sanitizeEntry(username, raw) {
 }
 
 export function parseContributeBody(body) {
-  if (!body || typeof body !== 'object' || !body.entries || typeof body.entries !== 'object') {
+  // An array would be accepted by Object.keys() and store entries under the
+  // handles "0", "1", ... -- the contract is an object keyed by handle.
+  if (!body || typeof body !== 'object' || !body.entries || typeof body.entries !== 'object' ||
+      Array.isArray(body.entries)) {
     return { ok: false, error: 'missing entries object' };
   }
   const keys = Object.keys(body.entries);

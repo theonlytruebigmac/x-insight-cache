@@ -14,6 +14,10 @@ import { config } from './config.js';
 mkdirSync(dirname(config.dbPath), { recursive: true });
 const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
+// In WAL mode NORMAL cannot corrupt the database; it only risks losing the last
+// few commits on power loss, which is fine for a re-fillable cache and avoids an
+// fsync (blocking the event loop) on every lookup's activity-counter write.
+db.pragma('synchronous = NORMAL');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS entries (
@@ -77,11 +81,14 @@ function getMeta(key, fallback) {
   return row ? row.value : fallback;
 }
 
-function incrMeta(key, by) {
-  const current = Number(getMeta(key, '0')) || 0;
-  const next = current + by;
+function setMeta(key, value) {
   db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-    .run(key, String(next));
+    .run(key, String(value));
+}
+
+function incrMeta(key, by) {
+  const next = (Number(getMeta(key, '0')) || 0) + by;
+  setMeta(key, next);
   return next;
 }
 
@@ -101,8 +108,9 @@ const pickNewer = (column) => `CASE
 const stmts = {
   getMany: db.prepare(`
     SELECT username, location, device, location_accurate, affiliation, account_id, created_at, username_changes, updated_at
-    FROM entries WHERE username IN (SELECT value FROM json_each(?))
+    FROM entries WHERE username IN (SELECT value FROM json_each(?)) AND updated_at >= ?
   `),
+  getEntriesByUsername: db.prepare('SELECT * FROM entries WHERE username IN (SELECT value FROM json_each(?))'),
   getNotFoundMany: db.prepare(`
     SELECT n.username, n.observed_at
     FROM not_found_entries n
@@ -213,10 +221,15 @@ export function useApiKey(token) {
     !!db.prepare('SELECT 1 FROM api_keys WHERE key_hash = ?').get(hash);
 }
 
-/** @param {string[]} usernames already-lowercased */
-export function getMany(usernames) {
+/**
+ * Entries past retention are not served even though the periodic sweep may not
+ * have deleted them yet (same boundary the sweep uses: `updated_at < cutoff`).
+ * @param {string[]} usernames already-lowercased
+ */
+export function getMany(usernames, retentionDays = config.retentionDays) {
   if (!usernames.length) return new Map();
-  const rows = stmts.getMany.all(JSON.stringify(usernames));
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400;
+  const rows = stmts.getMany.all(JSON.stringify(usernames), cutoff);
   return new Map(rows.map((r) => [r.username, r]));
 }
 
@@ -226,6 +239,18 @@ export function getNotFoundMany(usernames) {
   const now = Math.floor(Date.now() / 1000);
   const rows = stmts.getNotFoundMany.all(JSON.stringify(usernames), now);
   return new Map(rows.map((row) => [row.username, row]));
+}
+
+/**
+ * Counters and the "last contribution" time move in the same transaction as the
+ * rows they describe, and only when something was actually submitted: a batch
+ * that validated down to nothing must not look like a contribution.
+ */
+function recordContribution(count, now) {
+  if (!count) return;
+  incrMeta('total_contributions', count);
+  recordActivity({ contributionEntries: count });
+  setMeta('last_updated', now);
 }
 
 /** @param {Array<{username:string, location?, device?, locationAccurate?, affiliation?, accountId?, createdAt?, usernameChanges?, observedAt?}>} entries */
@@ -246,13 +271,9 @@ export function upsertMany(entries) {
       });
       stmts.clearOlderNotFound.run(e.username, Number.isInteger(e.observedAt) ? Math.min(e.observedAt, now) : now);
     }
+    recordContribution(rows.length, now);
   });
   tx(entries);
-  incrMeta('total_contributions', entries.length);
-  if (entries.length) recordActivity({ contributionEntries: entries.length });
-  incrMeta('last_updated', 0); // touch below via setMeta for a real timestamp
-  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-    .run('last_updated', String(now));
   return entries.length;
 }
 
@@ -270,12 +291,9 @@ export function upsertNotFoundMany(entries) {
         expiresAt: observedAt + config.notFoundTtlSeconds
       });
     }
+    recordContribution(rows.length, now);
   });
   tx(entries);
-  incrMeta('total_contributions', entries.length);
-  if (entries.length) recordActivity({ contributionEntries: entries.length });
-  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-    .run('last_updated', String(now));
   return entries.length;
 }
 
@@ -354,12 +372,31 @@ export function listEntries(filters, page, pageSize, retentionDays = config.rete
   })();
 }
 
-export function* iterateEntries(filters, retentionDays = config.retentionDays) {
+/**
+ * Stream every entry matching the filters, in dashboard order.
+ *
+ * Never holds a statement cursor (`.iterate()`) open across a yield. The caller
+ * awaits between rows (socket backpressure), and while a cursor is open
+ * better-sqlite3 rejects every other statement on the shared connection with
+ * "This database connection is busy executing a query" -- a slow or abandoned
+ * export would 500 every /lookup and /contribute, indefinitely. Instead, snapshot
+ * just the ordered handles up front, then read rows in short chunks; each chunk
+ * is fully read before anything is yielded.
+ */
+export function* iterateEntries(filters, retentionDays = config.retentionDays, chunkSize = 500) {
   const { where, params, order, orderDirection } = entryQuery(filters, retentionDays);
-  yield* db.prepare(`
-    SELECT * FROM entries ${where}
+  const usernames = db.prepare(`
+    SELECT username FROM entries ${where}
     ORDER BY ${order} ${orderDirection}, username ASC
-  `).iterate(params);
+  `).pluck().all(params);
+  for (let i = 0; i < usernames.length; i += chunkSize) {
+    const chunk = usernames.slice(i, i + chunkSize);
+    const rows = new Map(stmts.getEntriesByUsername.all(JSON.stringify(chunk)).map((row) => [row.username, row]));
+    for (const username of chunk) {
+      const row = rows.get(username); // absent if the retention sweep removed it meanwhile
+      if (row) yield row;
+    }
+  }
 }
 
 export function getBreakdowns(retentionDays = config.retentionDays) {
@@ -377,6 +414,12 @@ export function getBreakdowns(retentionDays = config.retentionDays) {
       SELECT COALESCE(NULLIF(TRIM(location), ''), 'Unknown') AS name, COUNT(*) AS count
       FROM entries GROUP BY COALESCE(NULLIF(TRIM(location), ''), 'Unknown')
       ORDER BY count DESC, name ASC LIMIT 12
+    `).all(),
+    // Every distinct device for the filter dropdown (the display list above is top-12 only).
+    deviceOptions: db.prepare(`
+      SELECT device AS name, COUNT(*) AS count FROM entries
+      WHERE device IS NOT NULL AND TRIM(device) <> ''
+      GROUP BY device ORDER BY count DESC, name ASC LIMIT 200
     `).all(),
     expiringEntries: db.prepare('SELECT COUNT(*) AS n FROM entries WHERE updated_at > ? AND updated_at <= ?')
       .get(cutoff, warningAt).n,
