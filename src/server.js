@@ -16,7 +16,7 @@ import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
 import { requireApiKey } from './auth.js';
 import { parseUsersParam, parseContributeBody } from './validate.js';
-import { getMany, getNotFoundMany, upsertMany, upsertNotFoundMany, getStats, cleanup, recordActivity } from './db.js';
+import db, { getMany, getNotFoundMany, upsertMany, upsertNotFoundMany, getStats, cleanup, recordActivity } from './db.js';
 import admin from './admin.js';
 
 if (!config.apiKey) {
@@ -34,46 +34,55 @@ if (!!config.adminUsername !== !!config.adminPassword) {
   process.exit(1);
 }
 app.disable('x-powered-by');
-// Trust exactly one hop of X-Forwarded-For. The only paths to this process
-// are Traefik (one real proxy hop, on the t3_proxy network) or 127.0.0.1 on
-// the Docker host itself -- there's no untrusted multi-hop chain in front of
-// it. Without this, express-rate-limit refuses to use X-Forwarded-For at all
-// (see ERR_ERL_UNEXPECTED_X_FORWARDED_FOR) and every client behind Traefik
-// collapses into one shared rate-limit bucket, same bug for admin.js's login
-// limiter. `1` -- not `true` -- deliberately: trusting only one hop means a
-// request straight to the loopback port can't spoof X-Forwarded-For to fake
-// a different rate-limit identity, since no real proxy added one there.
+// Trust exactly one hop of X-Forwarded-For. The expected deployment has one real
+// proxy hop in front of this process (Traefik on the t3_proxy network). Without
+// this, express-rate-limit refuses to use X-Forwarded-For at all (see
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR) and every client behind Traefik collapses
+// into one shared rate-limit bucket -- same for admin.js's login limiter.
+//
+// Know what this does and doesn't protect: with `1`, the TCP peer is treated as
+// the trusted proxy and the *last* X-Forwarded-For entry is taken as the client.
+// That is only correct if the proxy overwrites or appends to the header. A
+// client that connects to this port directly (the 127.0.0.1 published port on
+// the Docker host) can send any X-Forwarded-For and pick its own rate-limit
+// identity, so keep the port unreachable except from the proxy/host, and make
+// sure Traefik does not pass through client-supplied forwarded headers
+// (entrypoint forwardedHeaders.trustedIPs unset, or limited to your own CDN).
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '256kb' }));
-app.get('/', (req, res) => res.redirect('/admin/'));
-app.use('/admin', admin);
 
-app.use(
-  '/lookup',
-  rateLimit({
-    windowMs: config.rateLimitWindowMs,
-    limit: config.lookupRateLimit,
-    standardHeaders: true,
-    legacyHeaders: false,
-    handler: (_req, res) => {
-      recordActivity({ lookupRateLimited: 1 });
-      res.status(429).json({ error: 'Too many requests, please try again later.' });
-    }
-  })
-);
-app.use(
-  '/contribute',
-  rateLimit({
-    windowMs: config.rateLimitWindowMs,
-    limit: config.contributeRateLimit,
-    standardHeaders: true,
-    legacyHeaders: false,
-    handler: (_req, res) => {
-      recordActivity({ contributeRateLimited: 1 });
-      res.status(429).json({ error: 'Too many requests, please try again later.' });
-    }
-  })
-);
+const perIp = (limit, onLimit) => rateLimit({
+  windowMs: config.rateLimitWindowMs,
+  limit,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    onLimit?.();
+    res.status(429).json({ error: 'Too many requests, please try again later.' });
+  }
+});
+
+// Body parsing is wired per route, *after* rate limiting and auth, so an
+// unauthenticated or throttled client can't make the server buffer and parse
+// request bodies. Dashboard bodies are tiny (login, key label).
+app.get('/', (req, res) => res.redirect('/admin/'));
+app.use('/admin', express.json({ limit: '16kb' }), admin);
+
+// Liveness probe for the container HEALTHCHECK. Unauthenticated, reveals nothing,
+// and only proves the process is up and the database answers.
+app.get('/healthz', (req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+
+app.use('/lookup', perIp(config.lookupRateLimit, () => recordActivity({ lookupRateLimited: 1 })));
+app.use('/contribute', perIp(config.contributeRateLimit, () => recordActivity({ contributeRateLimited: 1 })));
+// /stats is key-gated like the rest, but unthrottled it would be an open
+// oracle for guessing the shared API_KEY.
+app.use('/stats', perIp(config.statsRateLimit));
 
 app.get('/lookup', requireApiKey, (req, res) => {
   const parsed = parseUsersParam(req.query.users);
@@ -82,11 +91,14 @@ app.get('/lookup', requireApiKey, (req, res) => {
     return;
   }
 
-  const rows = getMany(parsed.usernames);
+  const rows = getMany(parsed.usernames, config.retentionDays);
   const notFoundRows = getNotFoundMany(parsed.usernames);
-  const notFound = {};
+  // Null-prototype objects: "__proto__" is a valid X handle, and assigning
+  // results["__proto__"] on a plain object would set its prototype instead of
+  // adding the entry, silently dropping that account from the response.
+  const notFound = Object.create(null);
   const misses = [];
-  const results = {};
+  const results = Object.create(null);
   let hits = 0;
   let notFoundHits = 0;
   for (const username of parsed.usernames) {
@@ -121,7 +133,7 @@ app.get('/lookup', requireApiKey, (req, res) => {
   res.json({ results, notFound, misses });
 });
 
-app.post('/contribute', requireApiKey, (req, res) => {
+app.post('/contribute', requireApiKey, express.json({ limit: '256kb' }), (req, res) => {
   const parsed = parseContributeBody(req.body);
   if (!parsed.ok) {
     res.status(400).json({ error: parsed.error });
@@ -142,9 +154,15 @@ app.use((req, res) => {
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  if (req.path.startsWith('/admin/') && (err.status === 400 || err.status === 413)) {
-    console.warn('Rejected dashboard JSON request:', err.status);
-    res.status(err.status).json({ error: err.status === 413 ? 'Request body too large.' : 'Invalid JSON body.' });
+  if (res.headersSent) return next(err);
+  // Client errors raised by middleware (malformed JSON, oversized body, ...) are
+  // the client's fault: answer 4xx, don't log a stack trace or report a 500.
+  const status = err.status ?? err.statusCode;
+  if (Number.isInteger(status) && status >= 400 && status < 500) {
+    console.warn(`Rejected ${req.method} ${req.path}: ${status} ${err.type || err.message}`);
+    res.status(status).json({
+      error: status === 413 ? 'Request body too large.' : status === 400 ? 'Invalid JSON body.' : 'Bad request.'
+    });
     return;
   }
   console.error('Unhandled error:', err);
@@ -153,7 +171,7 @@ app.use((err, req, res, next) => {
 
 const removed = cleanup(config.retentionDays);
 if (removed) console.log(`Startup cleanup: removed ${removed} entries older than ${config.retentionDays} days`);
-setInterval(() => {
+const sweepTimer = setInterval(() => {
   const n = cleanup(config.retentionDays);
   if (n) console.log(`Cleanup: removed ${n} entries older than ${config.retentionDays} days`);
 }, config.cleanupIntervalMs);
@@ -161,3 +179,26 @@ setInterval(() => {
 const server = app.listen(config.port, () => {
   console.log(`x-insight-cache listening on :${server.address().port} (retention: ${config.retentionDays}d)`);
 });
+
+// Graceful shutdown. Containers run node as the main process, where an
+// unhandled SIGTERM is ignored: `docker stop` would wait out its grace period
+// and SIGKILL us without ever closing the database.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, shutting down`);
+  clearInterval(sweepTimer);
+  // Don't let a stuck request (e.g. a stalled export) outlast Docker's 10s grace.
+  setTimeout(() => {
+    console.error('Shutdown timed out; forcing exit');
+    process.exit(1);
+  }, 8000).unref();
+  server.close(() => {
+    try { db.close(); } catch (error) { console.error('Error closing database:', error); }
+    process.exit(0);
+  });
+  server.closeIdleConnections();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

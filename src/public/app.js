@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 let page = 1;
 let search = '';
 let loadVersion = 0;
+let knownPages = 1;
 let refreshTimer;
 const number = new Intl.NumberFormat();
 const entryColumns = [
@@ -43,11 +44,13 @@ async function api(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     credentials: 'same-origin'
   });
-  const data = await res.json();
+  // A proxy error page (e.g. a 502 from Traefik) is HTML, not JSON.
+  const data = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 401) showLogin();
-    throw new Error(data.error || `Request failed (${res.status}).`);
+    throw new Error(data?.error || `Request failed (${res.status}).`);
   }
+  if (data === null) throw new Error('The server returned an unexpected response.');
   return data;
 }
 
@@ -242,8 +245,8 @@ async function load() {
     renderBreakdown('location-breakdown', breakdowns.locations);
     const selectedDevice = $('device-filter').value;
     $('device-filter').replaceChildren(new Option('All devices', ''));
-    for (const item of breakdowns.devices) {
-      if (item.name !== 'Unknown') $('device-filter').add(new Option(`${item.name} (${number.format(item.count)})`, item.name));
+    for (const item of breakdowns.deviceOptions) {
+      $('device-filter').add(new Option(`${item.name} (${number.format(item.count)})`, item.name));
     }
     if ([...$('device-filter').options].some((option) => option.value === selectedDevice)) {
       $('device-filter').value = selectedDevice;
@@ -268,14 +271,17 @@ async function load() {
     const end = Math.min(page * data.pageSize, data.total);
     $('results-label').textContent = `${number.format(start)}-${number.format(end)} of ${number.format(data.total)} accounts`;
     $('page-label').textContent = `${page} / ${pages}`;
-    $('previous').disabled = page <= 1;
-    $('next').disabled = page >= pages;
+    knownPages = pages;
     $('refreshed').textContent = `Refreshed ${new Date().toLocaleTimeString()}`;
   } catch (error) {
     notice(error.message);
   } finally {
     if (version === loadVersion) {
       $('refresh').disabled = false;
+      // Restore pagination from the last known page count, so a failed refresh
+      // doesn't leave Previous/Next stuck disabled.
+      $('previous').disabled = page <= 1;
+      $('next').disabled = page >= knownPages;
       $('entries').removeAttribute('aria-busy');
     }
   }
@@ -285,6 +291,7 @@ async function showDashboard() {
   $('login-view').hidden = true;
   $('dashboard-view').hidden = false;
   page = 1;
+  knownPages = 1;
   search = '';
   $('search').value = '';
   try { $('auto-refresh').value = localStorage.getItem('xic-auto-refresh') || '0'; } catch { $('auto-refresh').value = '0'; }
@@ -390,7 +397,7 @@ $('auto-refresh').addEventListener('change', () => {
 });
 $('key-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const button = $('key-form button');
+  const button = event.target.querySelector('button[type="submit"]');
   button.disabled = true;
   $('key-notice').hidden = true;
   $('new-key').hidden = true;

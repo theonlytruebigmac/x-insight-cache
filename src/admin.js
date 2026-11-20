@@ -77,13 +77,22 @@ router.use('/api', (req, res, next) => {
 router.post('/api/session', rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  // Only failed attempts count: a legitimate admin signing in repeatedly must
+  // not be locked out, and the limit exists to stop password guessing.
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Try again in 15 minutes.' }
 }), (req, res) => {
   const { username, password } = req.body || {};
-  if (typeof username !== 'string' || typeof password !== 'string' ||
-      !safeEqual(username, config.adminUsername) || !safeEqual(password, config.adminPassword)) {
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    return res.status(401).json({ error: 'Invalid username or password.' });
+  }
+  // Evaluate both comparisons unconditionally so timing doesn't reveal whether
+  // the username alone was correct.
+  const usernameOk = safeEqual(username, config.adminUsername);
+  const passwordOk = safeEqual(password, config.adminPassword);
+  if (!(usernameOk && passwordOk)) {
     return res.status(401).json({ error: 'Invalid username or password.' });
   }
   pruneSessions();
@@ -204,6 +213,13 @@ router.get('/api/export', async (req, res, next) => {
   res.type(format === 'csv' ? 'text/csv' : 'application/json');
   if (format === 'csv') res.write(columns.join(',') + '\r\n');
   else res.write('[');
+  // If the client goes away while we're waiting on backpressure, 'drain' never
+  // fires; wake on 'close' too so the loop ends instead of hanging forever.
+  const drainOrClose = () => new Promise((resolve) => {
+    const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+    res.once('drain', done);
+    res.once('close', done);
+  });
   try {
     let first = true;
     for (const entry of iterateEntries(options.filters, config.retentionDays)) {
@@ -211,10 +227,10 @@ router.get('/api/export', async (req, res, next) => {
       const row = format === 'csv'
         ? columns.map((column) => csvValue(entry[column])).join(',') + '\r\n'
         : `${first ? '' : ','}${JSON.stringify(entry)}`;
-      if (!res.write(row)) await new Promise((resolve) => res.once('drain', resolve));
+      if (!res.write(row)) await drainOrClose();
       first = false;
     }
-    res.end(format === 'json' ? ']' : undefined);
+    if (!res.destroyed) res.end(format === 'json' ? ']' : undefined);
   } catch (error) {
     if (res.headersSent) return res.destroy(error);
     next(error);

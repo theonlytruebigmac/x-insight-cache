@@ -5,6 +5,7 @@
  * contract the extension's client code depends on.
  */
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -97,6 +98,23 @@ async function main() {
 
     r = await req('GET', '/lookup?users=' + Array.from({ length: 101 }, (_, i) => 'user' + i).join(','), {});
     check('lookup rejects batch over max -> 400', r.status === 400);
+
+    r = await req('GET', '/lookup?users=dupe,dupe,Dupe', {});
+    check('lookup de-duplicates repeated handles', r.json.misses.length === 1 && r.json.misses[0] === 'dupe');
+    let lower = await fetch(BASE + '/stats', { headers: { authorization: `bearer ${API_KEY}` } });
+    check('auth scheme is case-insensitive', lower.status === 200);
+
+    // --- malformed bodies are client errors, and are only parsed for authenticated callers ---
+    const rawContribute = (body, headers = {}) => fetch(BASE + '/contribute', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body
+    });
+    const authed = { authorization: `Bearer ${API_KEY}` };
+    let bad = await rawContribute('{bad', authed);
+    check('malformed JSON to /contribute -> 400, not 500', bad.status === 400);
+    bad = await rawContribute(JSON.stringify({ entries: {}, pad: 'x'.repeat(300000) }), authed);
+    check('oversized body to /contribute -> 413, not 500', bad.status === 413);
+    bad = await rawContribute('{bad');
+    check('unauthenticated request is rejected before its body is parsed', bad.status === 401);
 
     // --- contribute: valid + malformed entries in one batch ---
     r = await req('POST', '/contribute', {
@@ -213,6 +231,9 @@ async function main() {
       stats.retentionDays === 60 && Number.isInteger(stats.uptimeSeconds));
     response = await adminReq('breakdowns');
     const breakdowns = await response.json();
+    check('breakdowns list every device for the filter dropdown',
+      response.ok && breakdowns.deviceOptions.some((item) => item.name === 'iOS') &&
+      breakdowns.deviceOptions.every((item) => item.name !== 'Unknown'));
     check('breakdowns report populated devices and locations',
       response.ok && breakdowns.devices.some((item) => item.name === 'Web') &&
       breakdowns.locations.some((item) => item.name === 'Fakeland'));
@@ -314,6 +335,11 @@ async function main() {
     check('logout clears cookie', response.ok && response.headers.get('set-cookie').includes('Expires=Thu, 01 Jan 1970'));
     response = await adminReq('entries');
     check('logged-out session cannot be reused', response.status === 401);
+    const successes = [];
+    for (let attempt = 0; attempt < 12; attempt++) {
+      successes.push((await login({ username: 'admin', password: ADMIN_PASSWORD })).status);
+    }
+    check('successful logins do not count against the login limit', successes.every((status) => status === 200));
     for (let attempt = 0; attempt < 10; attempt++) {
       response = await login({ username: 'admin', password: 'wrong' });
     }
@@ -372,6 +398,12 @@ async function main() {
     const rB = await xffReq('203.0.113.20');
     check('a different X-Forwarded-For client has its own separate budget', rB.status === 200);
 
+    // IPv6 clients control a whole /64; rotating addresses inside it must not
+    // yield a fresh budget each time.
+    const v6 = [];
+    for (let i = 1; i <= 4; i++) v6.push((await xffReq(`2001:db8:1:2::${i}`)).status);
+    check('addresses within one IPv6 subnet share a rate-limit budget', v6.join() === '200,200,429,429');
+
     const login = await fetch(BASE + '/admin/api/session', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -391,6 +423,93 @@ async function main() {
   } finally {
     xffServer.kill();
     await new Promise((resolve) => xffServer.once('close', resolve));
+  }
+
+  console.log('=== /stats rate limit, /healthz, graceful shutdown, config validation ===');
+  const misc = startServer({ STATS_RATE_LIMIT: '2', DB_PATH: join(dbDir, 'misc.db') });
+  try {
+    await waitForServer(misc);
+    // "__proto__" is a valid handle; it must come back as a normal entry, not vanish.
+    const rawPost = (body) => fetch(BASE + '/contribute', {
+      method: 'POST', headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, body
+    });
+    let proto = await rawPost('{"entries":{"__proto__":{"l":"Peru","d":"iOS"},"constructor":{"l":"Chile","d":"Web"}}}');
+    check('handles that collide with Object.prototype names are accepted', (await proto.json()).accepted === 2);
+    const protoLookup = (await req('GET', '/lookup?users=__proto__,constructor,toString')).json;
+    check('a "__proto__" handle is returned as an ordinary entry, not dropped',
+      Object.hasOwn(protoLookup.results, '__proto__') && protoLookup.results['__proto__'].l === 'Peru' &&
+      protoLookup.results.constructor?.l === 'Chile' && protoLookup.misses.join() === 'tostring');
+    proto = await rawPost('{"entries":[{"l":"US","d":"iOS"}]}');
+    check('entries sent as an array are rejected rather than stored under "0", "1", ...', proto.status === 400);
+
+    const statuses = [];
+    for (let i = 0; i < 4; i++) statuses.push((await req('GET', '/stats')).status);
+    check('/stats is rate limited per client', statuses.join() === '200,200,429,429');
+    const health = await fetch(BASE + '/healthz');
+    check('/healthz is unauthenticated and reports ok', health.status === 200 && (await health.json()).ok === true);
+    const closed = new Promise((resolve) => misc.once('close', (code, signal) => resolve({ code, signal })));
+    misc.kill('SIGTERM');
+    const { code, signal } = await closed;
+    check('SIGTERM shuts the server down cleanly (exit 0, not killed)', code === 0 && signal === null);
+  } finally {
+    if (misc.exitCode === null && misc.signalCode === null) misc.kill('SIGKILL');
+  }
+  for (const bad of [{ RETENTION_DAYS: '6O' }, { CLEANUP_INTERVAL_MS: '0' }, { LOOKUP_RATE_LIMIT: '-5' }, { PORT: '99999' }]) {
+    const proc = startServer(bad);
+    const exit = await new Promise((resolve) => proc.on('exit', resolve));
+    check(`invalid ${Object.keys(bad)[0]}=${Object.values(bad)[0]} is a startup error`, exit !== 0);
+  }
+
+  console.log('=== export under backpressure (regression: an open cursor wedged the database) ===');
+  const exportDbPath = join(dbDir, 'export.db');
+  const exporter = startServer({ DB_PATH: exportDbPath });
+  try {
+    await waitForServer(exporter);
+    const seedDb = new Database(exportDbPath);
+    const seedInsert = seedDb.prepare('INSERT INTO entries (username, location, device, updated_at) VALUES (?, ?, ?, ?)');
+    const seedNow = Math.floor(Date.now() / 1000);
+    seedDb.transaction(() => {
+      for (let i = 0; i < 40000; i++) seedInsert.run('seed' + i, 'L'.repeat(60), 'D'.repeat(60), seedNow - i);
+    })();
+    seedDb.close();
+    const loginRes = await fetch(BASE + '/admin/api/session', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: ADMIN_PASSWORD })
+    });
+    const exportCookie = loginRes.headers.get('set-cookie').split(';')[0];
+    const contribute = (name) => req('POST', '/contribute', { body: { entries: { [name]: { l: 'US', d: 'iOS' } } } });
+
+    // A client that stops reading leaves the export blocked on socket backpressure.
+    await new Promise((resolve, reject) => {
+      const clientReq = http.get(`${BASE}/admin/api/export?format=json`, { headers: { cookie: exportCookie } }, (res) => {
+        res.pause();
+        setTimeout(async () => {
+          try {
+            const during = [
+              (await contribute('during')).status,
+              (await req('GET', '/lookup?users=during')).status,
+              (await fetch(BASE + '/admin/api/entries', { headers: { cookie: exportCookie } })).status
+            ];
+            check('contribute, lookup and dashboard keep working while an export is stalled', during.join() === '200,200,200');
+            res.destroy();
+            clientReq.destroy();
+            resolve();
+          } catch (error) { reject(error); }
+        }, 500);
+      });
+      clientReq.on('error', () => {});
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    check('server still accepts writes after a client abandons an export', (await contribute('after')).status === 200);
+
+    const full = await fetch(BASE + '/admin/api/export?format=json&sort=username&direction=asc', { headers: { cookie: exportCookie } });
+    const rows = await full.json();
+    check('a complete export contains every row exactly once',
+      full.ok && rows.length === 40002 && new Set(rows.map((row) => row.username)).size === 40002);
+    check('export honors the requested sort order', rows.every((row, i) => i === 0 || rows[i - 1].username < row.username));
+  } finally {
+    exporter.kill();
+    await new Promise((resolve) => exporter.once('close', resolve));
   }
 
   console.log('\n=== retention cleanup (direct unit test, not real time) ===');
@@ -421,6 +540,23 @@ async function main() {
   check('cleanup removes entries past retention', removed === 1);
   check('expired entry is actually gone', getMany(['willexpire']).size === 0);
 
+  const unitNow = Math.floor(Date.now() / 1000);
+  const insertRaw = db.prepare('INSERT INTO entries (username, location, device, updated_at) VALUES (?, ?, ?, ?)');
+  insertRaw.run('stale', 'X', 'Y', unitNow - 61 * 86400);
+  insertRaw.run('almoststale', 'X', 'Y', unitNow - 59 * 86400);
+  check('an entry past retention is not served even before the sweep removes it', !getMany(['stale'], 60).has('stale'));
+  check('an entry still inside retention is served', getMany(['almoststale'], 60).has('almoststale'));
+  db.prepare("DELETE FROM entries WHERE username IN ('stale', 'almoststale')").run();
+
+  db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_updated', '1000'), ('total_contributions', '7')").run();
+  upsertMany([]);
+  upsertNotFoundMany([]);
+  check('batches that validated down to nothing do not bump last_updated or the counters',
+    getStats().lastUpdated === new Date(1000 * 1000).toISOString() && getStats().totalContributions === 7);
+  upsertMany([{ username: 'counted', location: 'Peru', device: 'Web' }]);
+  check('a real contribution updates last_updated and the counters',
+    getStats().lastUpdated !== new Date(1000 * 1000).toISOString() && getStats().totalContributions === 8);
+
   const negativeNow = Math.floor(Date.now() / 1000);
   upsertNotFoundMany([{ username: 'negative', observedAt: negativeNow }]);
   check('a newer negative observation is returned', getNotFoundMany(['negative']).has('negative'));
@@ -444,7 +580,8 @@ async function main() {
     expired: { l: 'Germany', t: nowS - 61 * 86400 },
     oldnegative: { nf: true, t: nowS - 2 * 86400 },
     badt: { l: 'Germany', t: 'yesterday' },
-    undated: { l: 'Germany' }
+    undated: { l: 'Germany' },
+    nullt: { l: 'Germany', t: null }
   } });
   const byName = Object.fromEntries(parsed.entries.map((e) => [e.username, e]));
   check('t is kept as the observation time', byName.dated?.observedAt === nowS - 3600);
@@ -452,7 +589,21 @@ async function main() {
   check('a t past retention is dropped', !byName.expired);
   check('an already-expired not-found observation is dropped', !parsed.notFound.some((e) => e.username === 'oldnegative'));
   check('a malformed t is dropped', !byName.badt);
+  const cleaned = parseContributeBody({ entries: {
+    emoji: { l: 'a'.repeat(99) + '\u{1F600}', d: 'Web' },
+    ctrl: { l: 'Line1\nLine2\u0000\u001b[31mx', d: '\tWeb\r' },
+    lone: { l: 'ok\ud800end', d: 'Web' },
+    onlyctrl: { l: '\u0000\n', d: '\t' }
+  } }).entries;
+  const cleanedBy = Object.fromEntries(cleaned.map((e) => [e.username, e]));
+  check('truncating at the field limit never leaves half of a surrogate pair',
+    cleanedBy.emoji.location.isWellFormed() && cleanedBy.emoji.location.length <= 100);
+  check('control characters are stripped from stored fields',
+    !/[\u0000-\u001f\u007f-\u009f]/.test(cleanedBy.ctrl.location + cleanedBy.ctrl.device) && cleanedBy.ctrl.device === 'Web');
+  check('lone surrogates in input are replaced, not stored', cleanedBy.lone.location.isWellFormed());
+  check('a field made only of control characters counts as empty', !cleanedBy.onlyctrl);
   check('no t defaults to now (older clients)', byName.undated && Math.abs(byName.undated.observedAt - nowS) <= 1);
+  check('t: null is treated like no t', byName.nullt && Math.abs(byName.nullt.observedAt - nowS) <= 1);
 
   upsertMany([{ username: 'merge', location: 'France', device: 'iOS', accountId: '1', observedAt: nowS - 100 }]);
   upsertMany([{ username: 'merge', location: 'Spain', device: 'Android', affiliation: 'Acme', observedAt: nowS - 5000 }]);
